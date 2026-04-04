@@ -9,6 +9,10 @@
 
 # pwnWinDbg
 
+
+<img width="1580" height="948" alt="image" src="https://github.com/user-attachments/assets/a1e217c5-747b-4596-a174-b5674c1a1e73" />
+
+
 **A pwndbg-style debugger for Windows userland**, built from scratch on the Windows Debug API.
 
 pwnWinDbg brings the UX and workflow of [pwndbg](https://github.com/pwndbg/pwndbg) to Windows — color-coded context display, GDB-style commands, pointer chain analysis, ROP gadget search, and exploit development utilities, all in a native Windows CLI.
