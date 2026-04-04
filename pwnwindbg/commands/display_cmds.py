@@ -1,0 +1,173 @@
+"""Display commands: regs, disasm, context (auto-display on stop)."""
+
+from ..display.formatters import (
+    display_registers, display_disasm, display_stack, display_telescope,
+    display_backtrace, banner, separator, console, info, error,
+)
+from ..core.disasm import is_ret_instruction, is_branch_instruction, get_branch_target
+from ..core.memory import read_memory_safe, read_string, virtual_query
+
+
+def _make_imm_resolver(debugger):
+    """Create a callback that resolves an immediate value to a descriptive string.
+    Checks: symbol, string at address, pointer dereference."""
+    from ..utils.constants import MEM_COMMIT
+
+    def resolver(imm):
+        # Check if address is in committed memory
+        mbi = virtual_query(debugger.process_handle, imm)
+        if not mbi or mbi.State != MEM_COMMIT:
+            return None
+
+        # Try reading as a string first
+        s = read_string(debugger.process_handle, imm, 60)
+        if s and len(s) >= 2 and all(c.isprintable() or c in '\t\n\r' for c in s):
+            truncated = s[:50]
+            if len(s) > 50:
+                truncated += "..."
+            return f'"{truncated}"'
+
+        # Symbol resolution
+        sym = debugger.symbols.resolve_address(imm)
+        if sym:
+            return sym
+
+        return None
+
+    return resolver
+
+
+def _get_target_insns(debugger, insns, current_ip, ret_addr):
+    """If current IP is a ret or unconditional jmp, disassemble at the target."""
+    if not insns:
+        return None
+    for addr, size, mnemonic, op_str in insns:
+        if addr != current_ip:
+            continue
+        # ret → show instructions at return address
+        if is_ret_instruction(mnemonic) and ret_addr:
+            return debugger.get_disassembly(ret_addr, 12)
+        # unconditional jmp → show instructions at jump target
+        if mnemonic == "jmp":
+            target = get_branch_target(op_str)
+            if target:
+                return debugger.get_disassembly(target, 12)
+        break
+    return None
+
+
+def cmd_regs(debugger, args):
+    """Show registers: regs"""
+    regs, changed = debugger.get_registers()
+    if not regs:
+        error("Cannot read registers")
+        return None
+
+    display_registers(
+        regs, changed, debugger.is_wow64,
+        symbol_resolver=debugger.symbols.resolve_address,
+    )
+    return None
+
+
+def cmd_disasm(debugger, args):
+    """Disassemble at address: disasm [addr] [count]"""
+    from ..core.debugger import DebuggerState
+    if debugger.state not in (DebuggerState.STOPPED,) and not args.strip():
+        error("No process stopped. Use: disasm <address> [count]")
+        return None
+
+    parts = args.strip().split()
+    addr = None
+    count = 10
+
+    if parts:
+        from ..utils.addr_expr import eval_expr
+        addr = eval_expr(debugger, parts[0])
+        if addr is None:
+            error(f"Cannot resolve: {parts[0]}")
+            return None
+        if len(parts) > 1:
+            try:
+                count = int(parts[1])
+            except ValueError:
+                pass
+
+    # Auto-advance on repeat when explicit addr given
+    if addr is not None:
+        addr = debugger.track_examine("disasm", addr, 0)
+
+    insns = debugger.get_disassembly(addr, count)
+    if not insns:
+        error("Cannot disassemble")
+        return None
+
+    # Fix up next address for disasm auto-advance
+    if addr is not None and insns:
+        last_addr, last_size, _, _ = insns[-1]
+        debugger._examine_next["disasm"] = (debugger._examine_next["disasm"][0], last_addr + last_size)
+
+    current_ip = debugger._get_current_ip() if addr is None else 0
+    ret_target = debugger.get_return_address() if current_ip else None
+    display_disasm(
+        insns, current_ip,
+        symbol_resolver=debugger.symbols.resolve_address,
+        count=count,
+        ret_addr=ret_target,
+        imm_resolver=_make_imm_resolver(debugger),
+    )
+    return None
+
+
+def display_context(debugger):
+    """Display full context (registers + disasm + stack + backtrace) like pwndbg."""
+    console.print()
+
+    # 1. REGISTERS
+    regs, changed = debugger.get_registers()
+    if regs:
+        display_registers(
+            regs, changed, debugger.is_wow64,
+            symbol_resolver=debugger.symbols.resolve_address,
+        )
+
+    console.print()
+
+    # 2. DISASM
+    insns = debugger.get_disassembly(count=12)
+    if insns:
+        ip_key = "Eip" if debugger.is_wow64 else "Rip"
+        current_ip = regs.get(ip_key, 0)
+        ret_target = debugger.get_return_address()
+        target_insns = _get_target_insns(debugger, insns, current_ip, ret_target)
+        imm_res = _make_imm_resolver(debugger)
+        display_disasm(
+            insns, current_ip,
+            symbol_resolver=debugger.symbols.resolve_address,
+            count=12,
+            ret_addr=ret_target,
+            target_insns=target_insns,
+            imm_resolver=imm_res,
+        )
+
+    console.print()
+
+    # 3. STACK (telescope-style with pointer chains, strings, asm)
+    sp_key = "Esp" if debugger.is_wow64 else "Rsp"
+    sp = regs.get(sp_key, 0) if regs else 0
+    if sp:
+        chains = debugger.telescope(address=sp, depth=8)
+        if chains:
+            display_telescope(chains, sp, debugger.ptr_size, title="STACK")
+
+    console.print()
+
+    # 4. BACKTRACE
+    frames = debugger.get_backtrace(8)
+    if frames:
+        display_backtrace(
+            frames,
+            symbol_resolver=debugger.symbols.resolve_address,
+        )
+
+    separator()
