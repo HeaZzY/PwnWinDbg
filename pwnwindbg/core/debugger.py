@@ -98,6 +98,10 @@ class Debugger:
         self.last_event = None
         self.last_exception_code = None
         self.last_exception_addr = None
+        # Most recent stop_info dict returned from run_until_stop. Commands
+        # that need to introspect the previous stop (e.g. `analyze`) read
+        # from here without having to thread it through the dispatcher.
+        self.last_stop_info = None
 
         # Loaded DLL tracking for name resolution
         self._dll_handles = {}  # base_addr -> hFile
@@ -344,6 +348,7 @@ class Debugger:
 
             result = self._handle_event(event)
             if result:
+                self.last_stop_info = result
                 return result
 
     def _handle_event(self, event):
