@@ -1,6 +1,8 @@
 """Execution commands: run, attach, continue, step, breakpoints."""
 
 import os
+import shlex
+
 from ..display.formatters import error, info, success, warn, console
 
 
@@ -20,8 +22,7 @@ def cmd_run(debugger, args):
             error(f"Stdin file not found: {stdin_file}")
             return None
 
-    parts = raw.split(None, 1) if raw else []
-    if not parts:
+    if not raw:
         if debugger.exe_path:
             exe = debugger.exe_path
             extra_args = ""
@@ -29,8 +30,21 @@ def cmd_run(debugger, args):
             error("Usage: run <exe_path> [args] [< stdin_file]")
             return None
     else:
-        exe = parts[0]
-        extra_args = parts[1] if len(parts) > 1 else ""
+        # Use shlex with posix=False so Windows-style quoted paths
+        # ("C:\Program Files\..." …) survive intact.
+        try:
+            tokens = shlex.split(raw, posix=False)
+        except ValueError as e:
+            error(f"Failed to parse command line: {e}")
+            return None
+        if not tokens:
+            error("Usage: run <exe_path> [args] [< stdin_file]")
+            return None
+        exe = tokens[0]
+        # Strip surrounding quotes shlex left in place (posix=False keeps them).
+        if len(exe) >= 2 and exe[0] == exe[-1] and exe[0] in ('"', "'"):
+            exe = exe[1:-1]
+        extra_args = " ".join(tokens[1:]) if len(tokens) > 1 else ""
 
     if not os.path.exists(exe):
         error(f"File not found: {exe}")
