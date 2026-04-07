@@ -30,6 +30,7 @@ from .dt_cmds import cmd_dt
 from .errno_cmds import cmd_errno
 from .args_cmds import cmd_args
 from .hooks_cmds import cmd_hooks
+from .handles_cmds import cmd_handles
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -158,6 +159,7 @@ COMMANDS = {
     "args":         (cmd_args,      "Show argv / cmdline / cwd / image path"),
     "argv":         (cmd_args,      "Alias for args"),
     "hooks":        (cmd_hooks,     "Detect IAT/inline hooks: hooks [--iat|--inline] [mod]"),
+    "handles":      (cmd_handles,   "List handles: handles [--type T] [filter]"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
