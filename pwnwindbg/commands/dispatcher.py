@@ -37,6 +37,7 @@ from .tls_cmds import cmd_tls
 from .source_cmds import cmd_source
 from .vmprot_cmds import cmd_vmprot
 from .dprintf_cmds import cmd_dprintf
+from .session_cmds import cmd_session
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -175,6 +176,7 @@ COMMANDS = {
     "mprotect":     (cmd_vmprot,    "Alias for vmprot"),
     "dprintf":      (cmd_dprintf,   'Tracing BP: dprintf <addr> "fmt"  (auto-continues)'),
     "tprintf":      (cmd_dprintf,   "Alias for dprintf"),
+    "session":      (cmd_session,   "Save/load BPs+WPs: session save|load|show [path]"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
