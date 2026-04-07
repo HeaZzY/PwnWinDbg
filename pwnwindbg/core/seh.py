@@ -182,6 +182,184 @@ def list_runtime_functions(module_base, module_path):
     return out
 
 
+# ---------------------------------------------------------------------------
+# x64 stack unwinder built on UNWIND_INFO codes
+# ---------------------------------------------------------------------------
+
+# UnwindOp values from winnt.h
+UWOP_PUSH_NONVOL     = 0
+UWOP_ALLOC_LARGE     = 1
+UWOP_ALLOC_SMALL     = 2
+UWOP_SET_FPREG       = 3
+UWOP_SAVE_NONVOL     = 4
+UWOP_SAVE_NONVOL_FAR = 5
+UWOP_SAVE_XMM128     = 8
+UWOP_SAVE_XMM128_FAR = 9
+UWOP_PUSH_MACHFRAME  = 10
+
+
+def _compute_stack_delta_from_unwind(unwind_bytes):
+    """Sum the stack adjustments encoded in an UNWIND_INFO blob.
+
+    Returns (total_bytes, chained_runtime_function_rva or None).
+
+    `unwind_bytes` must be the raw UNWIND_INFO starting at the Version:Flags
+    byte. We assume RIP is past the function's full prolog — i.e. every
+    unwind code applies — which is the common case for any non-leaf frame.
+    Codes are walked in declaration order; the actual semantics is "in
+    reverse for unwinding", but for *summing* deltas the order is irrelevant.
+    """
+    if len(unwind_bytes) < 4:
+        return 0, None
+
+    ver_flags = unwind_bytes[0]
+    flags = ver_flags >> 3
+    count_of_codes = unwind_bytes[2]
+    codes_off = 4
+
+    total = 0
+    i = 0
+    while i < count_of_codes:
+        slot_off = codes_off + i * 2
+        if slot_off + 2 > len(unwind_bytes):
+            break
+        # CodeOffset = unwind_bytes[slot_off]   (unused — past-prolog assumption)
+        opcode_byte = unwind_bytes[slot_off + 1]
+        op = opcode_byte & 0x0F
+        op_info = (opcode_byte >> 4) & 0x0F
+
+        if op == UWOP_PUSH_NONVOL:
+            total += 8
+            slots = 1
+        elif op == UWOP_ALLOC_LARGE:
+            if op_info == 0:
+                # Next slot holds size in qwords
+                if slot_off + 4 > len(unwind_bytes):
+                    break
+                size_qw = unwind_bytes[slot_off + 2] | (unwind_bytes[slot_off + 3] << 8)
+                total += size_qw * 8
+                slots = 2
+            else:
+                # Next two slots hold full byte size
+                if slot_off + 6 > len(unwind_bytes):
+                    break
+                size = (unwind_bytes[slot_off + 2]
+                        | (unwind_bytes[slot_off + 3] << 8)
+                        | (unwind_bytes[slot_off + 4] << 16)
+                        | (unwind_bytes[slot_off + 5] << 24))
+                total += size
+                slots = 3
+        elif op == UWOP_ALLOC_SMALL:
+            total += (op_info + 1) * 8
+            slots = 1
+        elif op == UWOP_SET_FPREG:
+            slots = 1
+        elif op == UWOP_SAVE_NONVOL:
+            slots = 2
+        elif op == UWOP_SAVE_NONVOL_FAR:
+            slots = 3
+        elif op == UWOP_SAVE_XMM128:
+            slots = 2
+        elif op == UWOP_SAVE_XMM128_FAR:
+            slots = 3
+        elif op == UWOP_PUSH_MACHFRAME:
+            # 0 = no error code (5*8), 1 = with error code (6*8)
+            total += 0x30 if op_info else 0x28
+            slots = 1
+        else:
+            # Unknown op — bail out, we'd be guessing
+            return 0, None
+
+        i += slots
+
+    chained_rva = None
+    if flags & UNW_FLAG_CHAININFO:
+        # Skip codes (rounded to even count for alignment) — chained
+        # RUNTIME_FUNCTION sits right after.
+        aligned_codes = (count_of_codes + 1) & ~1
+        chain_off = codes_off + aligned_codes * 2
+        if chain_off + 12 <= len(unwind_bytes):
+            # We don't have the parent module base here, just return the offset
+            # so the caller can dispatch a recursive lookup.
+            chained_rva = chain_off
+
+    return total, chained_rva
+
+
+def unwind_one_frame_x64(read_mem_fn, modules, rip, rsp):
+    """Unwind a single x64 frame.
+
+    `read_mem_fn(addr, size)` reads bytes from the target.
+    `modules` is the list of loaded modules.
+    Returns (caller_rip, caller_rsp) or (None, None) if the frame can't be
+    resolved (leaf function, no .pdata coverage, or read failure).
+    """
+    # Find the module containing RIP
+    target_mod = None
+    for m in modules:
+        if m.base_address <= rip < m.end_address:
+            target_mod = m
+            break
+    if target_mod is None:
+        return None, None
+
+    rfs = list_runtime_functions(target_mod.base_address, target_mod.path)
+    if not rfs:
+        return None, None
+
+    # Find covering RUNTIME_FUNCTION
+    rf = None
+    for cand in rfs:
+        if cand["begin"] <= rip < cand["end"]:
+            rf = cand
+            break
+    if rf is None:
+        # Leaf function: no .pdata entry. RA is at [rsp].
+        ra = read_mem_fn(rsp, 8)
+        if ra is None or len(ra) < 8:
+            return None, None
+        import struct
+        return struct.unpack("<Q", ra)[0], rsp + 8
+
+    # Read the UNWIND_INFO blob from the loaded module's memory
+    ui_addr = target_mod.base_address + rf["unwind_rva"]
+    ui_bytes = read_mem_fn(ui_addr, 64)  # most are <32B; 64 covers the long ones
+    if not ui_bytes or len(ui_bytes) < 4:
+        return None, None
+
+    delta, _chained = _compute_stack_delta_from_unwind(ui_bytes)
+    # Note: chained unwind info would need recursion. Most prologs don't
+    # use it, so v1 ignores it and we accept some accuracy loss.
+
+    # The return address is right above the saved registers + stack alloc
+    ra_addr = rsp + delta
+    ra_bytes = read_mem_fn(ra_addr, 8)
+    if not ra_bytes or len(ra_bytes) < 8:
+        return None, None
+    import struct
+    caller_rip = struct.unpack("<Q", ra_bytes)[0]
+    caller_rsp = ra_addr + 8
+    return caller_rip, caller_rsp
+
+
+def backtrace_x64(read_mem_fn, modules, rip, rsp, max_frames=32):
+    """Walk frames using .pdata UNWIND_INFO. Returns list of (idx, rip)."""
+    frames = [(0, rip)]
+    cur_rip, cur_rsp = rip, rsp
+    seen = set()
+    for i in range(1, max_frames):
+        cur_rip, cur_rsp = unwind_one_frame_x64(read_mem_fn, modules, cur_rip, cur_rsp)
+        if cur_rip is None or cur_rip == 0:
+            break
+        if cur_rip in seen:
+            break
+        seen.add(cur_rip)
+        if cur_rip < 0x10000:
+            break
+        frames.append((i, cur_rip))
+    return frames
+
+
 def find_handler_for_address(modules, rip):
     """Find the SEH handler protecting `rip`, if any.
 

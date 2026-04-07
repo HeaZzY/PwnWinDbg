@@ -245,6 +245,12 @@ def cmd_entry(debugger, args):
     """Set a breakpoint at the PE entry point and continue.
 
     Usage: entry
+
+    Resolves entry as `runtime_image_base + EntryPoint RVA`. Under ASLR the
+    PE's static OPTIONAL_HEADER.ImageBase usually doesn't match where the
+    image actually got mapped, so we read the live module base from the
+    SymbolManager and only fall back to the static value if no module is
+    registered yet.
     """
     exe_path = debugger.exe_path
     if not exe_path:
@@ -258,16 +264,35 @@ def cmd_entry(debugger, args):
         return None
 
     try:
-        pe = pefile.PE(exe_path)
+        pe = pefile.PE(exe_path, fast_load=True)
         entry_rva = pe.OPTIONAL_HEADER.AddressOfEntryPoint
-        image_base = pe.OPTIONAL_HEADER.ImageBase
-        entry_va = entry_rva + image_base
+        static_base = pe.OPTIONAL_HEADER.ImageBase
         pe.close()
     except Exception as exc:
         error(f"Failed to parse PE: {exc}")
         return None
 
-    success(f"Entry point: {entry_va:#x}  (ImageBase {image_base:#x} + RVA {entry_rva:#x})")
+    # Resolve runtime base from loaded modules. Prefer the main exe by name.
+    import os
+    exe_name = os.path.basename(exe_path).lower()
+    runtime_base = None
+    if debugger.symbols and debugger.symbols.modules:
+        for m in debugger.symbols.modules:
+            if m.name.lower() == exe_name:
+                runtime_base = m.base_address
+                break
+        # Fallback: first registered module is the main exe in our refresh order
+        if runtime_base is None and debugger.symbols.modules:
+            runtime_base = debugger.symbols.modules[0].base_address
+
+    if runtime_base is None:
+        warn(f"No loaded module yet — using static ImageBase {static_base:#x} "
+             f"(may be wrong under ASLR)")
+        runtime_base = static_base
+
+    entry_va = runtime_base + entry_rva
+    success(f"Entry point: {entry_va:#x}  "
+            f"(base {runtime_base:#x} + RVA {entry_rva:#x})")
 
     debugger.bp_manager.add(debugger.process_handle, entry_va)
     debugger.bp_manager.save_address(entry_va)

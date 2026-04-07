@@ -2,7 +2,7 @@
 
 from ..display.formatters import (
     display_registers, display_disasm, display_stack, display_telescope,
-    display_backtrace, banner, separator, console, info, error,
+    display_backtrace, banner, separator, console, info, error, warn,
 )
 from ..core.disasm import is_ret_instruction, is_branch_instruction, get_branch_target
 from ..core.memory import read_memory_safe, read_string, virtual_query
@@ -75,7 +75,13 @@ def cmd_regs(debugger, args):
 
 
 def cmd_disasm(debugger, args):
-    """Disassemble at address: disasm [addr] [count]"""
+    """Disassemble at address: disasm [addr|symbol] [count]
+
+    Flags:
+        -f / --func    Disassemble the entire function containing <addr>.
+                       Uses x64 .pdata RUNTIME_FUNCTION bounds when possible,
+                       and otherwise scans forward until the first ret.
+    """
     from .kd_cmds import _kd_session
     if _kd_session and _kd_session.connected:
         from .kd_cmds import cmd_kddisasm
@@ -88,18 +94,35 @@ def cmd_disasm(debugger, args):
     parts = args.strip().split()
     addr = None
     count = 10
+    func_mode = False
 
-    if parts:
+    # Strip flags from positional args
+    positional = []
+    for p in parts:
+        if p in ("-f", "--func", "--function"):
+            func_mode = True
+        else:
+            positional.append(p)
+
+    if positional:
         from ..utils.addr_expr import eval_expr
-        addr = eval_expr(debugger, parts[0])
+        addr = eval_expr(debugger, positional[0])
         if addr is None:
-            error(f"Cannot resolve: {parts[0]}")
+            error(f"Cannot resolve: {positional[0]}")
             return None
-        if len(parts) > 1:
+        if len(positional) > 1:
             try:
-                count = int(parts[1])
+                count = int(positional[1])
             except ValueError:
                 pass
+
+    if func_mode:
+        if addr is None:
+            addr = debugger._get_current_ip()
+            if addr is None:
+                error("No current RIP")
+                return None
+        return _disasm_function(debugger, addr)
 
     # Auto-advance on repeat when explicit addr given
     if addr is not None:
@@ -121,6 +144,104 @@ def cmd_disasm(debugger, args):
         insns, current_ip,
         symbol_resolver=debugger.symbols.resolve_address,
         count=count,
+        ret_addr=ret_target,
+        imm_resolver=_make_imm_resolver(debugger),
+    )
+    return None
+
+
+def _disasm_function(debugger, addr):
+    """Disassemble the entire function containing `addr`.
+
+    Tries .pdata RUNTIME_FUNCTION bounds first (x64). Falls back to a
+    forward scan that stops on the first `ret` if .pdata is unavailable
+    or doesn't cover the address.
+    """
+    begin, end, source = _resolve_function_bounds(debugger, addr)
+    if begin is None:
+        # Fallback: scan until first ret, capped at 256 instructions
+        return _disasm_scan_until_ret(debugger, addr)
+
+    size = end - begin
+    if size <= 0 or size > 0x10000:
+        warn(f"Function range {begin:#x}-{end:#x} looks bogus, falling back")
+        return _disasm_scan_until_ret(debugger, addr)
+
+    # Estimate instruction count generously (avg 4 bytes/insn)
+    est_count = max(16, size // 3)
+    insns = debugger.get_disassembly(begin, est_count)
+    if not insns:
+        error(f"Cannot disassemble at {begin:#x}")
+        return None
+
+    # Trim instructions to the function bounds
+    insns = [i for i in insns if i[0] < end]
+
+    info(f"Disassembling function {begin:#x}-{end:#x} "
+         f"({size} bytes, {len(insns)} insns) [{source}]")
+
+    current_ip = debugger._get_current_ip()
+    ret_target = debugger.get_return_address()
+    display_disasm(
+        insns, current_ip,
+        symbol_resolver=debugger.symbols.resolve_address,
+        count=len(insns),
+        ret_addr=ret_target,
+        imm_resolver=_make_imm_resolver(debugger),
+    )
+    return None
+
+
+def _resolve_function_bounds(debugger, addr):
+    """Return (begin, end, source) for the function containing `addr`,
+    or (None, None, None) if no .pdata covers it.
+    """
+    if not debugger.symbols or not debugger.symbols.modules:
+        return None, None, None
+
+    target_mod = None
+    for m in debugger.symbols.modules:
+        if m.base_address <= addr < m.end_address:
+            target_mod = m
+            break
+    if target_mod is None:
+        return None, None, None
+
+    try:
+        from ..core.seh import list_runtime_functions
+        rfs = list_runtime_functions(target_mod.base_address, target_mod.path)
+    except Exception:
+        return None, None, None
+
+    # Linear scan — RUNTIME_FUNCTIONs are sorted by begin in .pdata
+    for rf in rfs:
+        if rf["begin"] <= addr < rf["end"]:
+            return rf["begin"], rf["end"], f".pdata of {target_mod.name}"
+    return None, None, None
+
+
+def _disasm_scan_until_ret(debugger, addr):
+    """Forward-scan disassembly fallback: stop on first ret (or 256 insns)."""
+    MAX = 256
+    insns = debugger.get_disassembly(addr, MAX)
+    if not insns:
+        error(f"Cannot disassemble at {addr:#x}")
+        return None
+
+    trimmed = []
+    for i in insns:
+        trimmed.append(i)
+        mnem = i[2].lower() if isinstance(i[2], str) else ""
+        if mnem.startswith("ret"):
+            break
+
+    info(f"Function (forward-scan from {addr:#x}, {len(trimmed)} insns)")
+    current_ip = debugger._get_current_ip()
+    ret_target = debugger.get_return_address()
+    display_disasm(
+        trimmed, current_ip,
+        symbol_resolver=debugger.symbols.resolve_address,
+        count=len(trimmed),
         ret_addr=ret_target,
         imm_resolver=_make_imm_resolver(debugger),
     )

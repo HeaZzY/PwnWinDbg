@@ -921,7 +921,13 @@ class Debugger:
         return entries, sp
 
     def get_backtrace(self, max_frames=10):
-        """Walk the stack frames to build a backtrace."""
+        """Walk the stack frames to build a backtrace.
+
+        On x64, prefers .pdata UNWIND_INFO-based unwinding (the only correct
+        approach since most x64 functions don't maintain an RBP frame). Falls
+        back to RBP frame chaining on x86 / WoW64 or when .pdata coverage
+        fails.
+        """
         th = self.get_active_thread_handle()
         if not th:
             return []
@@ -930,6 +936,23 @@ class Debugger:
         bp_val = get_bp(ctx, self.is_wow64)
         sp = get_sp(ctx, self.is_wow64)
 
+        # ---- x64: try the .pdata-based unwinder first ----
+        if not self.is_wow64 and self.symbols and self.symbols.modules:
+            from .seh import backtrace_x64
+            from .memory import read_memory_safe
+
+            def _read(addr, size):
+                return read_memory_safe(self.process_handle, addr, size)
+
+            try:
+                frames = backtrace_x64(_read, self.symbols.modules,
+                                       ip, sp, max_frames=max_frames)
+            except Exception:
+                frames = []
+            if len(frames) >= 2:
+                return frames
+
+        # ---- Fallback: RBP frame chaining (x86 / WoW64 / no .pdata) ----
         frames = [(0, ip)]
         current_bp = bp_val
         from .memory import read_ptr
