@@ -36,6 +36,7 @@ from .procs_cmds import cmd_procs
 from .tls_cmds import cmd_tls
 from .source_cmds import cmd_source
 from .vmprot_cmds import cmd_vmprot
+from .dprintf_cmds import cmd_dprintf
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -172,6 +173,8 @@ COMMANDS = {
     "script":       (cmd_source,    "Alias for source"),
     "vmprot":       (cmd_vmprot,    "Change page protection: vmprot <addr> <size> <perm>"),
     "mprotect":     (cmd_vmprot,    "Alias for vmprot"),
+    "dprintf":      (cmd_dprintf,   'Tracing BP: dprintf <addr> "fmt"  (auto-continues)'),
+    "tprintf":      (cmd_dprintf,   "Alias for dprintf"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),

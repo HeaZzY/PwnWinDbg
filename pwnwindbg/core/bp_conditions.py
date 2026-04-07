@@ -76,6 +76,64 @@ def build_namespace(debugger):
     return ns
 
 
+def format_dprintf(debugger, fmt):
+    """Render a `dprintf` format string against the live state.
+
+    `{expr}` placeholders are evaluated in the same constrained namespace
+    as `evaluate_condition`. A trailing `:hex`, `:x`, `:s`, `:d` modifier
+    selects how the value is rendered. Examples:
+
+        "rcx={rcx:hex}, len={rdx}, str={cstr(rcx)}"
+        "name={wstr(rcx):s}"
+
+    Returns the rendered string, or an "<error: ...>" marker on failure.
+    """
+    if not fmt:
+        return ""
+    ns = build_namespace(debugger)
+    out = []
+    i = 0
+    while i < len(fmt):
+        ch = fmt[i]
+        if ch == "{" and i + 1 < len(fmt) and fmt[i + 1] == "{":
+            out.append("{"); i += 2; continue
+        if ch == "}" and i + 1 < len(fmt) and fmt[i + 1] == "}":
+            out.append("}"); i += 2; continue
+        if ch != "{":
+            out.append(ch); i += 1; continue
+        # Find matching close brace (no nesting)
+        j = fmt.find("}", i + 1)
+        if j == -1:
+            out.append(fmt[i:]); break
+        body = fmt[i + 1:j]
+        i = j + 1
+        # Optional :spec
+        spec = ""
+        if ":" in body:
+            expr, spec = body.rsplit(":", 1)
+            spec = spec.strip()
+        else:
+            expr = body
+        try:
+            val = _safe_eval(expr.strip(), ns)
+        except Exception as e:
+            out.append(f"<{type(e).__name__}: {e}>")
+            continue
+        if val is None:
+            out.append("None"); continue
+        if spec in ("x", "hex"):
+            out.append(hex(int(val)))
+        elif spec == "d":
+            out.append(str(int(val)))
+        elif spec == "s":
+            out.append(str(val))
+        elif isinstance(val, int):
+            out.append(hex(val))
+        else:
+            out.append(str(val))
+    return "".join(out)
+
+
 def evaluate_condition(debugger, expr):
     """Evaluate `expr` against the current debugger state.
 

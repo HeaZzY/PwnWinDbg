@@ -23,11 +23,17 @@ class Breakpoint:
         # If set and evaluates to a falsy value, the debugger silently
         # continues. See core/bp_conditions.py for the eval namespace.
         self.condition = None
+        # Tracing BP (dprintf): optional format string. When set, the BP
+        # silently prints the rendered string and auto-continues — it
+        # never stops execution. {expr} placeholders are evaluated in
+        # the same namespace as `condition`.
+        self.action = None
 
     def __repr__(self):
         state = "enabled" if self.enabled else "disabled"
         cond = f" if {self.condition}" if self.condition else ""
-        return f"BP#{self.id} @ {self.address:#x} ({state}, hits={self.hit_count}){cond}"
+        act = f' do "{self.action}"' if self.action else ""
+        return f"BP#{self.id} @ {self.address:#x} ({state}, hits={self.hit_count}){cond}{act}"
 
 
 class BreakpointManager:

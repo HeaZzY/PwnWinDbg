@@ -483,13 +483,45 @@ class Debugger:
                         warn(f"BP#{bp.id} condition error: {err}")
                         # Treat eval errors as a real stop so the user notices
                     elif not truthy:
-                        # Step over the BP, then continue (re_enable_after_single_step
-                        # will fire on the SINGLE_STEP exception below).
-                        self._single_stepping = False
+                        # Step over the BP, then let the outer run_until_stop
+                        # loop pick up the next event (returning None instead
+                        # of recursing avoids blowing the Python stack on
+                        # heavily-trafficked tracing/conditional BPs).
+                        # NOTE: do NOT touch _single_stepping. The existing
+                        # _step_over_bp re-enable path in the SINGLE_STEP
+                        # handler already does the right thing: it absorbs
+                        # the trap fire when the user wasn't stepping, and
+                        # surfaces it as a step stop when they were.
                         set_trap_flag(ctx)
                         set_context(th, ctx, self.is_wow64)
                         self.continue_execution()
-                        return self.run_until_stop()
+                        return None
+
+                # dprintf-style action: render the format string, print it,
+                # then transparently single-step past the BP and continue.
+                # Tracing breakpoints never stop the debugger.
+                if bp.action:
+                    from .bp_conditions import format_dprintf
+                    from ..display.formatters import console
+                    from rich.text import Text
+                    try:
+                        rendered = format_dprintf(self, bp.action)
+                    except Exception as e:
+                        rendered = f"<dprintf error: {e}>"
+                    line = Text()
+                    line.append(f"[BP#{bp.id} @ {bp_addr:#x}] ", style="bright_magenta")
+                    line.append(rendered, style="bright_white")
+                    console.print(line)
+                    # Step over the BP and let the outer loop continue.
+                    # Like the conditional-BP path: do NOT touch
+                    # _single_stepping. The _step_over_bp re-enable in the
+                    # SINGLE_STEP handler will absorb the trap fire if the
+                    # user is just running, or surface it as a step stop if
+                    # they were single-stepping when the dprintf fired.
+                    set_trap_flag(ctx)
+                    set_context(th, ctx, self.is_wow64)
+                    self.continue_execution()
+                    return None
 
                 return {"reason": "breakpoint", "bp": bp, "address": bp_addr, "tid": tid}
             else:
@@ -533,10 +565,12 @@ class Debugger:
                 self.bp_manager.re_enable_after_single_step(self.process_handle, self._step_over_bp)
                 self._step_over_bp = None
 
-                # If we were just doing internal step-over-bp (not user step), continue
+                # If we were just doing internal step-over-bp (not user step),
+                # continue and let the outer run_until_stop loop pick up the
+                # next event (no recursion -> no stack overflow on hot BPs).
                 if not self._single_stepping:
                     self.continue_execution()
-                    return self.run_until_stop()
+                    return None
 
             self._single_stepping = False
 
