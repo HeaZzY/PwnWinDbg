@@ -28,12 +28,18 @@ class Breakpoint:
         # never stops execution. {expr} placeholders are evaluated in
         # the same namespace as `condition`.
         self.action = None
+        # Thread-specific BP: when set, the BP only stops execution if
+        # the firing thread's TID matches. Other threads silently step
+        # past it via the same path as a falsy conditional.
+        self.thread_id = None
 
     def __repr__(self):
         state = "enabled" if self.enabled else "disabled"
         cond = f" if {self.condition}" if self.condition else ""
         act = f' do "{self.action}"' if self.action else ""
-        return f"BP#{self.id} @ {self.address:#x} ({state}, hits={self.hit_count}){cond}{act}"
+        thr = f" thread {self.thread_id}" if self.thread_id is not None else ""
+        return (f"BP#{self.id} @ {self.address:#x} "
+                f"({state}, hits={self.hit_count}){thr}{cond}{act}")
 
 
 class BreakpointManager:

@@ -500,6 +500,17 @@ class Debugger:
                 self._step_over_bp = bp
                 self.state = DebuggerState.STOPPED
 
+                # Thread-specific breakpoint: if the firing thread doesn't
+                # match the target TID, treat the BP as silently passing
+                # through. Same step-over-and-continue path as a falsy
+                # condition. Checked BEFORE condition/action so we don't
+                # spend cycles evaluating either on the wrong thread.
+                if bp.thread_id is not None and bp.thread_id != tid:
+                    set_trap_flag(ctx)
+                    set_context(th, ctx, self.is_wow64)
+                    self.continue_execution()
+                    return None
+
                 # Conditional breakpoint: if condition evaluates to false,
                 # silently single-step past the BP and continue running.
                 if bp.condition:

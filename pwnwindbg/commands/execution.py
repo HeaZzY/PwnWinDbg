@@ -158,14 +158,19 @@ def cmd_stepuntil(debugger, args):
 
 
 def cmd_bp(debugger, args):
-    """Set breakpoint: bp <address> [if <condition>]
+    """Set breakpoint: bp <address> [thread <tid>] [if <condition>]
+
+    `thread <tid>` and `if <expr>` may appear in either order. The BP
+    only stops when both filters match — wrong thread silently steps
+    past, same as a falsy condition.
 
     Examples:
         bp 0x401000
         bp WinExec
         bp *0x401000+0x10
         bp 0x401000 if rax == 0x42
-        bp WinExec if qword(rsp+8) == 0x4141414141414141
+        bp WinExec thread 0x1234
+        bp WinExec thread 0x1234 if qword(rsp+8) == 0x4141414141414141
     """
     from .kd_cmds import _kd_session
     if _kd_session and _kd_session.connected:
@@ -173,22 +178,55 @@ def cmd_bp(debugger, args):
         return cmd_kdbp(debugger, args)
     args = args.strip()
     if not args:
-        error("Usage: bp <address|symbol> [if <condition>]")
+        error("Usage: bp <address|symbol> [thread <tid>] [if <condition>]")
         return None
 
-    # Split off "if <condition>" tail
-    condition = None
-    addr_part = args
-    # Use a token-aware split: look for the keyword `if` surrounded by spaces
+    # Pull out optional `thread <tid>` and `if <expr>` clauses. Either
+    # order is accepted; whichever appears first ends the address.
+    # `if` consumes the rest of the line up to a trailing `thread` clause
+    # (or end), so conditions can contain spaces and operators freely.
     tokens = args.split()
-    for i, tok in enumerate(tokens):
-        if tok.lower() == "if" and i > 0:
-            addr_part = " ".join(tokens[:i])
-            condition = " ".join(tokens[i + 1:])
+    condition = None
+    thread_id = None
+    head_end = len(tokens)
+    i = 0
+    while i < len(tokens):
+        t = tokens[i].lower()
+        if i > 0 and t == "thread":
+            head_end = min(head_end, i)
+            if i + 1 >= len(tokens):
+                error("`thread` requires a TID value")
+                return None
+            try:
+                thread_id = int(tokens[i + 1], 0)
+            except ValueError:
+                error(f"Invalid TID: {tokens[i + 1]}")
+                return None
+            # Drop these two tokens and keep scanning for `if`
+            tokens = tokens[:i] + tokens[i + 2:]
+            continue
+        if i > 0 and t == "if":
+            head_end = min(head_end, i)
+            # `if` consumes everything until end or a `thread` keyword
+            j = i + 1
+            end = len(tokens)
+            while j < len(tokens):
+                if tokens[j].lower() == "thread":
+                    end = j
+                    break
+                j += 1
+            condition = " ".join(tokens[i + 1:end]).strip()
             if not condition:
                 error("Empty condition after `if`")
                 return None
-            break
+            tokens = tokens[:i] + tokens[end:]
+            continue
+        i += 1
+
+    if not tokens[:head_end]:
+        error("Missing address")
+        return None
+    addr_part = " ".join(tokens[:head_end])
 
     # Strip GDB-style '*' prefix
     if addr_part.startswith("*"):
@@ -205,9 +243,14 @@ def cmd_bp(debugger, args):
     debugger.bp_manager.save_address(addr)
     if condition is not None:
         bp.condition = condition
-        success(f"Breakpoint #{bp.id} set at {addr:#x} if {condition}")
-    else:
-        success(f"Breakpoint #{bp.id} set at {addr:#x}")
+    if thread_id is not None:
+        bp.thread_id = thread_id
+    parts = [f"Breakpoint #{bp.id} set at {addr:#x}"]
+    if thread_id is not None:
+        parts.append(f"thread {thread_id}")
+    if condition is not None:
+        parts.append(f"if {condition}")
+    success(" ".join(parts))
     return None
 
 
