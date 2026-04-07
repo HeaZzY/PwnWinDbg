@@ -54,6 +54,10 @@ class Debugger:
         self.main_thread_handle = None
         self.main_thread_id = None
         self.exe_path = None
+        # Last spawn arguments — saved so `run` (no args) and `rerun`
+        # can re-launch the same target without retyping.
+        self.exe_args = ""
+        self.exe_stdin_file = None
         self.image_base = None
 
         # Architecture
@@ -201,6 +205,8 @@ class Debugger:
         self.main_thread_handle = pi.hThread
         self.main_thread_id = pi.dwThreadId
         self.exe_path = os.path.abspath(exe_path)
+        self.exe_args = args or ""
+        self.exe_stdin_file = stdin_file
         self.active_thread_id = pi.dwThreadId
         self.threads[pi.dwThreadId] = pi.hThread
 
@@ -215,6 +221,16 @@ class Debugger:
 
         self.state = DebuggerState.RUNNING
         self.first_breakpoint_hit = False
+        # Reset per-session counters so a re-spawn (rerun) actually
+        # stops at the new process's initial BP. Without this, the
+        # second run sees `_initial_bp_count` carried over from the
+        # previous run and silently skips the initial breakpoint —
+        # the debuggee then runs free until it self-terminates.
+        self._initial_bp_count = 0
+        self._interrupt_requested = False
+        self.last_stop_info = None
+        self.last_exception_code = None
+        self.last_exception_addr = None
 
         return True
 

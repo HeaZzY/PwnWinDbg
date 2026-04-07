@@ -7,7 +7,12 @@ from ..display.formatters import error, info, success, warn, console
 
 
 def cmd_run(debugger, args):
-    """Spawn a process: run <exe> [args] [< stdin_file]"""
+    """Spawn a process: run <exe> [args] [< stdin_file]
+
+    With no arguments, re-spawns the most recently launched executable
+    using the same args and stdin redirection. To re-launch with new
+    args without retyping the path, see `rerun`.
+    """
     raw = args.strip()
 
     # Parse stdin redirection: run exe args < file
@@ -25,7 +30,11 @@ def cmd_run(debugger, args):
     if not raw:
         if debugger.exe_path:
             exe = debugger.exe_path
-            extra_args = ""
+            extra_args = debugger.exe_args or ""
+            # Re-use last stdin redirection unless the user explicitly
+            # passed `< file` on this invocation.
+            if stdin_file is None:
+                stdin_file = debugger.exe_stdin_file
         else:
             error("Usage: run <exe_path> [args] [< stdin_file]")
             return None
@@ -50,9 +59,60 @@ def cmd_run(debugger, args):
         error(f"File not found: {exe}")
         return None
 
+    return _spawn_and_run(debugger, exe, extra_args, stdin_file)
+
+
+def cmd_rerun(debugger, args):
+    """Re-run the last executable with optional new args.
+
+    Usage:
+        rerun                 — same exe + same args as last run
+        rerun <new args...>   — same exe but with new args
+        rerun < new_stdin     — same exe + args, but new stdin file
+
+    Auto-terminates the previous process if it's still alive.
+    """
+    if not debugger.exe_path:
+        error("Nothing to rerun — no exe has been launched yet")
+        return None
+
+    raw = args.strip()
+    stdin_file = debugger.exe_stdin_file
+
+    # Same `< file` parsing as cmd_run, but everything else is just
+    # the new arg list (no exe token).
+    if "<" in raw:
+        left, right = raw.rsplit("<", 1)
+        stdin_file = right.strip() or None
+        if stdin_file and stdin_file.startswith('"') and stdin_file.endswith('"'):
+            stdin_file = stdin_file[1:-1]
+        raw = left.strip()
+        if stdin_file and not os.path.exists(stdin_file):
+            error(f"Stdin file not found: {stdin_file}")
+            return None
+
+    new_args = raw if raw else (debugger.exe_args or "")
+    return _spawn_and_run(debugger, debugger.exe_path, new_args, stdin_file)
+
+
+def _spawn_and_run(debugger, exe, extra_args, stdin_file):
+    """Shared spawn helper used by both `run` and `rerun`.
+
+    If a previous process is still alive, terminate it first so we
+    don't leak handles or end up debugging two children at once.
+    """
+    from ..core.debugger import DebuggerState
+    if debugger.state not in (DebuggerState.IDLE, DebuggerState.TERMINATED):
+        try:
+            debugger.terminate()
+            info("Terminated previous process")
+        except Exception:
+            pass
+
     try:
         debugger.spawn(exe, extra_args, stdin_file=stdin_file)
-        info(f"Spawned process PID={debugger.process_id} ({exe})")
+        cmdline = exe + (f" {extra_args}" if extra_args else "")
+        info(f"Spawned process PID={debugger.process_id} ({cmdline})")
         info(f"Architecture: {'x86 (WoW64)' if debugger.is_wow64 else 'x64'}")
         if stdin_file:
             info(f"Stdin: {stdin_file}")
