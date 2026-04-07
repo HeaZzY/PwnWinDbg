@@ -129,11 +129,19 @@ def _print_insn(addr, size, mnemonic, op_str, current_ip,
 
 
 def _print_call_args(args):
-    """Render `arg name : value (annotation)` lines under the call line."""
+    """Render `arg name : value (annotation)` lines under the call line.
+
+    Pads the name column to whatever the widest arg name is so prototypes
+    with longer names (`lpFileName`, `dwCreationDisposition`) line up.
+    """
+    if not args:
+        return
+    name_width = max(len(name) for name, _, _ in args)
+    name_width = max(name_width, 5)  # keep at least the legacy 5-char column
     for name, val, ann in args:
         line = Text()
         line.append("        ", style="")
-        line.append(f"{name:5s}", style="bright_yellow")
+        line.append(f"{name:{name_width}s}", style="bright_yellow")
         line.append(" = ", style="bright_black")
         if val is None:
             line.append("??", style="bright_red")

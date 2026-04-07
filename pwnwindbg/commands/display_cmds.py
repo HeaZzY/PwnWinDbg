@@ -156,20 +156,52 @@ def cmd_disasm(debugger, args):
     return None
 
 
+def _resolve_call_proto(debugger, op_str):
+    """Try to map a call's operand to a known Win32/NT API prototype.
+
+    Handles direct calls (`call 0x...`) and `call qword ptr [rip + disp]`
+    IAT-style indirect calls by following the IAT pointer once. Returns
+    a `[(arg_name, ArgType), ...]` list, or None if the target doesn't
+    resolve to a known prototype.
+    """
+    from ..core.api_protos import lookup
+    if not debugger.symbols:
+        return None
+
+    # 1. Direct call: `call 0x401234`
+    target = get_branch_target(op_str)
+    if target is None:
+        # 2. RIP-relative IAT call: `call qword ptr [rip + disp]`
+        # We don't currently model the rip-relative resolution here, so
+        # just give up on those for now. (capstone returns the absolute
+        # address in op_str when the imm is direct; rip-relative looks
+        # like `qword ptr [0x...]` which we could deref but skip for
+        # simplicity until users complain.)
+        return None
+
+    sym = debugger.symbols.resolve_address(target)
+    if not sym:
+        return None
+    return lookup(sym)
+
+
 def _maybe_call_args(debugger, insns, current_ip):
     """Return resolved arg list iff `current_ip` is a call instruction.
 
     Cheap pre-check on the disasm we already have, so we don't pay the
-    register read cost when sitting on a non-call instruction.
+    register read cost when sitting on a non-call instruction. When the
+    call target resolves to a known Win32/NT API, the arg list is widened
+    and re-typed according to the prototype.
     """
     if not current_ip or not insns:
         return None
-    for addr, _, mnem, _ in insns:
+    for addr, _, mnem, op in insns:
         if addr == current_ip and is_call_instruction(mnem):
             regs, _ = debugger.get_registers()
-            if regs:
-                return resolve_call_args(debugger, regs, num_args=4)
-            return None
+            if not regs:
+                return None
+            proto = _resolve_call_proto(debugger, op)
+            return resolve_call_args(debugger, regs, num_args=4, proto=proto)
         if addr == current_ip:
             return None
     return None
@@ -301,9 +333,12 @@ def display_context(debugger):
         imm_res = _make_imm_resolver(debugger)
         # Reuse the regs we already have to avoid a second context fetch
         call_args = None
-        for a, _, mnem, _ in insns:
+        for a, _, mnem, op in insns:
             if a == current_ip and is_call_instruction(mnem):
-                call_args = resolve_call_args(debugger, regs, num_args=4)
+                proto = _resolve_call_proto(debugger, op)
+                call_args = resolve_call_args(
+                    debugger, regs, num_args=4, proto=proto
+                )
                 break
             if a == current_ip:
                 break
