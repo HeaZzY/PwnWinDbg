@@ -64,6 +64,9 @@ from .kd_nav_cmds import cmd_kdbt, cmd_kdxinfo
 from .kd_search_cmds import cmd_kdsearch
 from .kd_pte_cmds import cmd_kdpte
 from .kd_dt_cmds import cmd_kddt
+from .kd_callback_cmds import cmd_kdcallbacks
+from .kd_ssdt_cmds import cmd_kdssdt
+from .kd_vad_cmds import cmd_kdvad
 from ..display.formatters import error, info, console
 
 
@@ -268,6 +271,11 @@ COMMANDS = {
     "kdfind":       (cmd_kdsearch,      "Alias for kdsearch"),
     "kdpte":        (cmd_kdpte,         "Walk page tables for a virtual address: kdpte <addr>"),
     "kddt":         (cmd_kddt,          "Display struct: kddt _EPROCESS [addr]"),
+
+    # Kernel: rootkit / SSDT / VAD inspection
+    "kdcallbacks":  (cmd_kdcallbacks,   "Enumerate Psp{Process,Thread,Image}Notify callback arrays"),
+    "kdssdt":       (cmd_kdssdt,        "Dump KeServiceDescriptorTable: kdssdt [count] [-h]"),
+    "kdvad":        (cmd_kdvad,         "Walk a process VAD tree: kdvad <pid|name> [-x|-w]"),
 }
 
 
@@ -321,6 +329,10 @@ KD_AUTO_ROUTE = {
     "dbgprint":    "kddbgprint",
     "write":       "kdwrite",
     "dt":          "kddt",
+    # rootkit / SSDT / VAD
+    "callbacks":   "kdcallbacks",
+    "ssdt":        "kdssdt",
+    "vad":         "kdvad",
 }
 
 
@@ -484,6 +496,11 @@ _KERNEL_HELP = {
         ("search -s|-x|-p",           "Search kernel memory  [--module M]"),
         ("pte <vaddr>",               "Walk page tables (PML4→PDPT→PD→PT)"),
         ("dt <_STRUCT> [addr]",       "WinDbg-style struct view (currently _EPROCESS)"),
+    ],
+    "Rootkit / SSDT / VAD": [
+        ("callbacks",                 "Enumerate Psp{Process,Thread,Image}Notify routines"),
+        ("ssdt [count] [-h]",         "Dump KeServiceDescriptorTable (`-h` = hooks only)"),
+        ("vad <pid|name> [-x|-w]",    "Walk a process VAD tree (filter exec / writable)"),
     ],
 }
 
