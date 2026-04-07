@@ -26,3 +26,11 @@ Desktop.ini
 # Project-specific excludes
 tests/
 CLAUDE.md
+
+# Local reference clones / scratch / test artifacts
+pwndbg/
+test_heap.exe
+test_heap.c
+test_heap_simple.py
+compile_test.bat
+_test_kd.py

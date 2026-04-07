@@ -602,6 +602,24 @@ kernel32.TerminateProcess.restype = BOOL
 kernel32.DebugBreakProcess.argtypes = [HANDLE]
 kernel32.DebugBreakProcess.restype = BOOL
 
+# NtQueryInformationProcess — used by heap analyzer to read PEB
+class PROCESS_BASIC_INFORMATION(Structure):
+    _fields_ = [
+        ("ExitStatus", c_ulong),
+        ("PebBaseAddress", c_void_p),
+        ("AffinityMask", c_void_p),
+        ("BasePriority", c_ulong),
+        ("UniqueProcessId", c_void_p),
+        ("InheritedFromUniqueProcessId", c_void_p),
+    ]
+
+ntdll.NtQueryInformationProcess.argtypes = [
+    HANDLE, ctypes.c_int, LPVOID, ctypes.c_ulong, POINTER(ctypes.c_ulong),
+]
+ntdll.NtQueryInformationProcess.restype = ctypes.c_long
+
+ProcessBasicInformation = 0  # PROCESSINFOCLASS
+
 kernel32.CreateFileW.argtypes = [LPCWSTR, DWORD, DWORD, PVOID, DWORD, DWORD, HANDLE]
 kernel32.CreateFileW.restype = HANDLE
 
@@ -623,12 +641,41 @@ VK_F12 = 0x7B
 # ---------------------------------------------------------------------------
 
 try:
-    dbghelp = ctypes.windll.dbghelp
+    # use_last_error=True so ctypes.get_last_error() returns DbgHelp errors
+    # reliably (default ctypes.windll wrappers can clobber GetLastError between
+    # the actual call and the Python check).
+    dbghelp = ctypes.WinDLL("dbghelp", use_last_error=True)
 
     SYMOPT_UNDNAME = 0x00000002
     SYMOPT_DEFERRED_LOADS = 0x00000004
     SYMOPT_LOAD_LINES = 0x00000010
+    SYMOPT_FAIL_CRITICAL_ERRORS = 0x00000200
+    SYMOPT_AUTO_PUBLICS = 0x00010000
+    SYMOPT_NO_PROMPTS = 0x00080000
     SYMOPT_DEBUG = 0x80000000
+
+    # SymTagEnum / SYM_TYPE values for IMAGEHLP_MODULE64.SymType
+    SymNone = 0
+    SymCoff = 1
+    SymCv = 2
+    SymPdb = 3
+    SymExport = 4
+    SymDeferred = 5
+    SymSym = 6
+    SymDia = 7
+    SymVirtual = 8
+
+    SYM_TYPE_NAMES = {
+        SymNone: "none",
+        SymCoff: "coff",
+        SymCv: "cv",
+        SymPdb: "pdb",
+        SymExport: "export",
+        SymDeferred: "deferred",
+        SymSym: "sym",
+        SymDia: "dia",
+        SymVirtual: "virtual",
+    }
 
     # Symbol info structure
     MAX_SYM_NAME = 2000
@@ -652,6 +699,43 @@ try:
             ("Name", c_char * MAX_SYM_NAME),
         ]
 
+    class GUID(Structure):
+        _fields_ = [
+            ("Data1", DWORD),
+            ("Data2", c_ushort),
+            ("Data3", c_ushort),
+            ("Data4", c_ubyte * 8),
+        ]
+
+    # IMAGEHLP_MODULE64 — used by SymGetModuleInfo64 to query a module's
+    # symbol load state (deferred, pdb, export-only, etc.) and PDB metadata.
+    class IMAGEHLP_MODULE64(Structure):
+        _fields_ = [
+            ("SizeOfStruct", DWORD),
+            ("BaseOfImage", c_ulonglong),
+            ("ImageSize", DWORD),
+            ("TimeDateStamp", DWORD),
+            ("CheckSum", DWORD),
+            ("NumSyms", DWORD),
+            ("SymType", DWORD),
+            ("ModuleName", c_char * 32),
+            ("ImageName", c_char * 256),
+            ("LoadedImageName", c_char * 256),
+            ("LoadedPdbName", c_char * 256),
+            ("CVSig", DWORD),
+            ("CVData", c_char * (260 * 3)),
+            ("PdbSig", DWORD),
+            ("PdbSig70", GUID),
+            ("PdbAge", DWORD),
+            ("PdbUnmatched", BOOL),
+            ("DbgUnmatched", BOOL),
+            ("LineNumbers", BOOL),
+            ("GlobalSymbols", BOOL),
+            ("TypeInfo", BOOL),
+            ("SourceIndexed", BOOL),
+            ("Publics", BOOL),
+        ]
+
     dbghelp.SymInitialize.argtypes = [HANDLE, LPCSTR, BOOL]
     dbghelp.SymInitialize.restype = BOOL
 
@@ -660,6 +744,9 @@ try:
 
     dbghelp.SymSetOptions.argtypes = [DWORD]
     dbghelp.SymSetOptions.restype = DWORD
+
+    dbghelp.SymGetOptions.argtypes = []
+    dbghelp.SymGetOptions.restype = DWORD
 
     dbghelp.SymFromAddr.argtypes = [HANDLE, c_ulonglong, POINTER(c_ulonglong), POINTER(SYMBOL_INFO)]
     dbghelp.SymFromAddr.restype = BOOL
@@ -671,6 +758,27 @@ try:
         HANDLE, HANDLE, LPCSTR, LPCSTR, c_ulonglong, DWORD, LPVOID, DWORD,
     ]
     dbghelp.SymLoadModuleEx.restype = c_ulonglong
+
+    dbghelp.SymUnloadModule64.argtypes = [HANDLE, c_ulonglong]
+    dbghelp.SymUnloadModule64.restype = BOOL
+
+    dbghelp.SymGetModuleInfo64.argtypes = [HANDLE, c_ulonglong, POINTER(IMAGEHLP_MODULE64)]
+    dbghelp.SymGetModuleInfo64.restype = BOOL
+
+    dbghelp.SymSetSearchPath.argtypes = [HANDLE, LPCSTR]
+    dbghelp.SymSetSearchPath.restype = BOOL
+
+    dbghelp.SymGetSearchPath.argtypes = [HANDLE, ctypes.c_char_p, DWORD]
+    dbghelp.SymGetSearchPath.restype = BOOL
+
+    dbghelp.SymRefreshModuleList.argtypes = [HANDLE]
+    dbghelp.SymRefreshModuleList.restype = BOOL
+
+    # Callback type for SymEnumSymbols (PSYM_ENUMERATESYMBOLS_CALLBACK)
+    SYMENUMPROC = ctypes.WINFUNCTYPE(BOOL, POINTER(SYMBOL_INFO), c_ulong, c_void_p)
+
+    dbghelp.SymEnumSymbols.argtypes = [HANDLE, c_ulonglong, LPCSTR, SYMENUMPROC, c_void_p]
+    dbghelp.SymEnumSymbols.restype = BOOL
 
     DBGHELP_AVAILABLE = True
 except Exception:

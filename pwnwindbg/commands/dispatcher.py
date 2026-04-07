@@ -18,6 +18,8 @@ from .nav_cmds import (
     cmd_xinfo, cmd_distance, cmd_entry, cmd_hexdump, cmd_print,
 )
 from .rop_cmds import cmd_rop
+from .heap_cmds import cmd_heap, cmd_chunks, cmd_bins, cmd_vis, cmd_find_chunks
+from .pdb_cmds import cmd_pdb
 from .kd_cmds import (
     cmd_kdconnect, cmd_kddisconnect, cmd_kdregs, cmd_kdmem, cmd_kdwrite,
     cmd_kdbp, cmd_kdbpd, cmd_kdcontinue, cmd_kdstep, cmd_kdstepover,
@@ -104,6 +106,13 @@ COMMANDS = {
     "xinfo":        (cmd_xinfo,     "Address info: xinfo <addr>"),
     "distance":     (cmd_distance,  "Distance: distance <addr1> <addr2>"),
 
+    # Heap analysis
+    "heap":         (cmd_heap,      "List process heaps: heap"),
+    "chunks":       (cmd_chunks,    "List heap chunks: chunks [heap_addr]"),
+    "bins":         (cmd_bins,      "Show free bins: bins [heap_addr]"),
+    "vis":          (cmd_vis,       "Visual heap layout: vis [heap_addr] [--compact]"),
+    "find-chunks":  (cmd_find_chunks, "Find chunks: find-chunks --size <n> [--free] [--contains <str>]"),
+
     # Info
     "info":         (cmd_info,      "Info commands: info <proc|maps|modules|functions>"),
     "vmmap":        (cmd_vmmap,     "Memory map: vmmap"),
@@ -113,6 +122,11 @@ COMMANDS = {
     "modules":      (cmd_modules,   "List loaded modules"),
     "functions":    (cmd_functions, "List functions: functions [filter]"),
     "funcs":        (cmd_functions, "Alias for functions"),
+
+    # Symbols / PDB
+    "pdb":          (cmd_pdb,       "PDB symbols: pdb [status|path|cache|load <module|all>]"),
+    "symbols":      (cmd_pdb,       "Alias for pdb"),
+    "syms":         (cmd_pdb,       "Alias for pdb"),
 
     # Kernel debugging
     "kdconnect":    (cmd_kdconnect,     "Connect to kernel target: kdconnect gdb:|net:|pipe: ..."),
@@ -306,6 +320,13 @@ _USERLAND_HELP = {
         ("p2p <addr>",            "Deep pointer chain"),
         ("xinfo <addr>",          "Detailed address info (region/module/perms)"),
         ("distance <a> <b>",      "Offset between two addresses"),
+    ],
+    "Heap analysis": [
+        ("heap",                  "List all process heaps (CRT, NT, LFH, Segment)"),
+        ("chunks [heap_addr]",    "List chunks in heap (malloc/HeapAlloc)"),
+        ("bins [heap_addr]",      "Show free bins/buckets by size"),
+        ("vis [heap_addr]",       "Visual heap layout (pwndbg-style)"),
+        ("find-chunks <criteria>","Search chunks by size/state/content"),
     ],
     "Info": [
         ("info proc",             "Process info (PID, path, arch)"),
