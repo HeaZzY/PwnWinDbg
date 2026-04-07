@@ -4,8 +4,12 @@ from ..display.formatters import (
     display_registers, display_disasm, display_stack, display_telescope,
     display_backtrace, banner, separator, console, info, error, warn,
 )
-from ..core.disasm import is_ret_instruction, is_branch_instruction, get_branch_target
+from ..core.disasm import (
+    is_ret_instruction, is_branch_instruction, is_call_instruction,
+    get_branch_target,
+)
 from ..core.memory import read_memory_safe, read_string, virtual_query
+from ..core.call_args import resolve_call_args
 
 
 def _make_imm_resolver(debugger):
@@ -140,13 +144,34 @@ def cmd_disasm(debugger, args):
 
     current_ip = debugger._get_current_ip() if addr is None else 0
     ret_target = debugger.get_return_address() if current_ip else None
+    call_args = _maybe_call_args(debugger, insns, current_ip)
     display_disasm(
         insns, current_ip,
         symbol_resolver=debugger.symbols.resolve_address,
         count=count,
         ret_addr=ret_target,
         imm_resolver=_make_imm_resolver(debugger),
+        call_args=call_args,
     )
+    return None
+
+
+def _maybe_call_args(debugger, insns, current_ip):
+    """Return resolved arg list iff `current_ip` is a call instruction.
+
+    Cheap pre-check on the disasm we already have, so we don't pay the
+    register read cost when sitting on a non-call instruction.
+    """
+    if not current_ip or not insns:
+        return None
+    for addr, _, mnem, _ in insns:
+        if addr == current_ip and is_call_instruction(mnem):
+            regs, _ = debugger.get_registers()
+            if regs:
+                return resolve_call_args(debugger, regs, num_args=4)
+            return None
+        if addr == current_ip:
+            return None
     return None
 
 
@@ -182,12 +207,14 @@ def _disasm_function(debugger, addr):
 
     current_ip = debugger._get_current_ip()
     ret_target = debugger.get_return_address()
+    call_args = _maybe_call_args(debugger, insns, current_ip)
     display_disasm(
         insns, current_ip,
         symbol_resolver=debugger.symbols.resolve_address,
         count=len(insns),
         ret_addr=ret_target,
         imm_resolver=_make_imm_resolver(debugger),
+        call_args=call_args,
     )
     return None
 
@@ -238,12 +265,14 @@ def _disasm_scan_until_ret(debugger, addr):
     info(f"Function (forward-scan from {addr:#x}, {len(trimmed)} insns)")
     current_ip = debugger._get_current_ip()
     ret_target = debugger.get_return_address()
+    call_args = _maybe_call_args(debugger, trimmed, current_ip)
     display_disasm(
         trimmed, current_ip,
         symbol_resolver=debugger.symbols.resolve_address,
         count=len(trimmed),
         ret_addr=ret_target,
         imm_resolver=_make_imm_resolver(debugger),
+        call_args=call_args,
     )
     return None
 
@@ -270,6 +299,14 @@ def display_context(debugger):
         ret_target = debugger.get_return_address()
         target_insns = _get_target_insns(debugger, insns, current_ip, ret_target)
         imm_res = _make_imm_resolver(debugger)
+        # Reuse the regs we already have to avoid a second context fetch
+        call_args = None
+        for a, _, mnem, _ in insns:
+            if a == current_ip and is_call_instruction(mnem):
+                call_args = resolve_call_args(debugger, regs, num_args=4)
+                break
+            if a == current_ip:
+                break
         display_disasm(
             insns, current_ip,
             symbol_resolver=debugger.symbols.resolve_address,
@@ -277,6 +314,7 @@ def display_context(debugger):
             ret_addr=ret_target,
             target_insns=target_insns,
             imm_resolver=imm_res,
+            call_args=call_args,
         )
 
     console.print()

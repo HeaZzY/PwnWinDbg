@@ -198,16 +198,21 @@ UWOP_SAVE_XMM128_FAR = 9
 UWOP_PUSH_MACHFRAME  = 10
 
 
-def _compute_stack_delta_from_unwind(unwind_bytes):
+def _compute_stack_delta_from_unwind(unwind_bytes, max_offset=None):
     """Sum the stack adjustments encoded in an UNWIND_INFO blob.
 
     Returns (total_bytes, chained_runtime_function_rva or None).
 
     `unwind_bytes` must be the raw UNWIND_INFO starting at the Version:Flags
-    byte. We assume RIP is past the function's full prolog — i.e. every
-    unwind code applies — which is the common case for any non-leaf frame.
-    Codes are walked in declaration order; the actual semantics is "in
-    reverse for unwinding", but for *summing* deltas the order is irrelevant.
+    byte. By default we assume RIP is past the function's full prolog — i.e.
+    every unwind code applies — which is the common case for any non-leaf
+    frame. Pass `max_offset = RIP - function_begin` to handle the
+    mid-prolog case: only codes with CodeOffset <= max_offset are counted.
+
+    Codes are walked in declaration order; for summing deltas the order
+    doesn't matter, but `CodeOffset` is the offset of the LAST byte of the
+    prolog instruction that is being undone, so the threshold check is
+    correct in either order.
     """
     if len(unwind_bytes) < 4:
         return 0, None
@@ -223,13 +228,19 @@ def _compute_stack_delta_from_unwind(unwind_bytes):
         slot_off = codes_off + i * 2
         if slot_off + 2 > len(unwind_bytes):
             break
-        # CodeOffset = unwind_bytes[slot_off]   (unused — past-prolog assumption)
+        code_offset = unwind_bytes[slot_off]
         opcode_byte = unwind_bytes[slot_off + 1]
         op = opcode_byte & 0x0F
         op_info = (opcode_byte >> 4) & 0x0F
 
+        # Skip codes whose corresponding prolog instruction has not yet
+        # executed. We still need to advance `i` past their slots so we
+        # don't misinterpret operand bytes as new opcodes.
+        already_executed = (max_offset is None) or (code_offset <= max_offset)
+
         if op == UWOP_PUSH_NONVOL:
-            total += 8
+            if already_executed:
+                total += 8
             slots = 1
         elif op == UWOP_ALLOC_LARGE:
             if op_info == 0:
@@ -237,7 +248,8 @@ def _compute_stack_delta_from_unwind(unwind_bytes):
                 if slot_off + 4 > len(unwind_bytes):
                     break
                 size_qw = unwind_bytes[slot_off + 2] | (unwind_bytes[slot_off + 3] << 8)
-                total += size_qw * 8
+                if already_executed:
+                    total += size_qw * 8
                 slots = 2
             else:
                 # Next two slots hold full byte size
@@ -247,10 +259,12 @@ def _compute_stack_delta_from_unwind(unwind_bytes):
                         | (unwind_bytes[slot_off + 3] << 8)
                         | (unwind_bytes[slot_off + 4] << 16)
                         | (unwind_bytes[slot_off + 5] << 24))
-                total += size
+                if already_executed:
+                    total += size
                 slots = 3
         elif op == UWOP_ALLOC_SMALL:
-            total += (op_info + 1) * 8
+            if already_executed:
+                total += (op_info + 1) * 8
             slots = 1
         elif op == UWOP_SET_FPREG:
             slots = 1
@@ -264,7 +278,8 @@ def _compute_stack_delta_from_unwind(unwind_bytes):
             slots = 3
         elif op == UWOP_PUSH_MACHFRAME:
             # 0 = no error code (5*8), 1 = with error code (6*8)
-            total += 0x30 if op_info else 0x28
+            if already_executed:
+                total += 0x30 if op_info else 0x28
             slots = 1
         else:
             # Unknown op — bail out, we'd be guessing
@@ -286,13 +301,18 @@ def _compute_stack_delta_from_unwind(unwind_bytes):
     return total, chained_rva
 
 
-def unwind_one_frame_x64(read_mem_fn, modules, rip, rsp):
+def unwind_one_frame_x64(read_mem_fn, modules, rip, rsp, mid_prolog=False):
     """Unwind a single x64 frame.
 
     `read_mem_fn(addr, size)` reads bytes from the target.
     `modules` is the list of loaded modules.
     Returns (caller_rip, caller_rsp) or (None, None) if the frame can't be
     resolved (leaf function, no .pdata coverage, or read failure).
+
+    `mid_prolog`: when True, only unwind codes whose CodeOffset <= (rip -
+    function_begin) are summed. Use this for the *currently executing*
+    frame, where the prolog may be only partially executed (e.g. inside
+    `finish` right after a `call`).
     """
     # Find the module containing RIP
     target_mod = None
@@ -327,7 +347,14 @@ def unwind_one_frame_x64(read_mem_fn, modules, rip, rsp):
     if not ui_bytes or len(ui_bytes) < 4:
         return None, None
 
-    delta, _chained = _compute_stack_delta_from_unwind(ui_bytes)
+    # SizeOfProlog is at +1; if RIP is past the full prolog, every code
+    # has executed, so we don't need to filter. mid_prolog forces filtering.
+    size_of_prolog = ui_bytes[1]
+    func_off = rip - rf["begin"]
+    max_offset = None
+    if mid_prolog and func_off < size_of_prolog:
+        max_offset = func_off
+    delta, _chained = _compute_stack_delta_from_unwind(ui_bytes, max_offset=max_offset)
     # Note: chained unwind info would need recursion. Most prologs don't
     # use it, so v1 ignores it and we accept some accuracy loss.
 

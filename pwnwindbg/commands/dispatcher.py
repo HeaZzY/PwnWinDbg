@@ -3,7 +3,7 @@
 from .execution import (
     cmd_run, cmd_attach, cmd_continue, cmd_step_into, cmd_step_over,
     cmd_finish, cmd_bp, cmd_bl, cmd_bd, cmd_detach, cmd_kill, cmd_retbreak,
-    cmd_bpcond,
+    cmd_bpcond, cmd_stepuntil,
 )
 from .examine import parse_x_command
 from .info_cmds import (
@@ -26,6 +26,7 @@ from .pdb_cmds import cmd_pdb
 from .watch_cmds import cmd_watch
 from .peb_cmds import cmd_peb, cmd_teb
 from .seh_cmds import cmd_seh
+from .dt_cmds import cmd_dt
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -59,6 +60,8 @@ COMMANDS = {
     "n":            (cmd_step_over, "Alias for ni"),
     "finish":       (cmd_finish,    "Run until function returns"),
     "fin":          (cmd_finish,    "Alias for finish"),
+    "stepuntil":    (cmd_stepuntil, "Run until address: stepuntil <addr|sym>"),
+    "until":        (cmd_stepuntil, "Alias for stepuntil"),
     "nextcall":     (cmd_nextcall,  "Step until next call instruction"),
     "nc":           (cmd_nextcall,  "Alias for nextcall"),
     "nextret":      (cmd_nextret,   "Step until next ret instruction"),
@@ -146,6 +149,7 @@ COMMANDS = {
     "peb":          (cmd_peb,       "Show PEB: peb [-v|modules|env|params]"),
     "teb":          (cmd_teb,       "Show TEB: teb [-v|<tid>|all]"),
     "seh":          (cmd_seh,       "SEH inspection: seh [chain|here|module <name>|all]"),
+    "dt":           (cmd_dt,        "Display struct type: dt [_STRUCT] [addr]"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
@@ -206,7 +210,6 @@ COMMANDS = {
     "kdfind":       (cmd_kdsearch,      "Alias for kdsearch"),
     "kdpte":        (cmd_kdpte,         "Walk page tables for a virtual address: kdpte <addr>"),
     "kddt":         (cmd_kddt,          "Display struct: kddt _EPROCESS [addr]"),
-    "dt":           (cmd_kddt,          "Alias for kddt (WinDbg-style)"),
 }
 
 
@@ -259,6 +262,7 @@ KD_AUTO_ROUTE = {
     "version":     "kdversion",
     "dbgprint":    "kddbgprint",
     "write":       "kdwrite",
+    "dt":          "kddt",
 }
 
 

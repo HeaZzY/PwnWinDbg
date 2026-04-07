@@ -156,6 +156,39 @@ PEB_LDR_DATA_X64 = OrderedDict([
 ])
 
 
+# LDR_DATA_TABLE_ENTRY — one loaded module entry inside PEB.Ldr lists
+LDR_DATA_TABLE_ENTRY_X64 = OrderedDict([
+    ("InLoadOrderLinks.Flink",          (0x000, "ptr")),
+    ("InLoadOrderLinks.Blink",          (0x008, "ptr")),
+    ("InMemoryOrderLinks.Flink",        (0x010, "ptr")),
+    ("InMemoryOrderLinks.Blink",        (0x018, "ptr")),
+    ("InInitOrderLinks.Flink",          (0x020, "ptr")),
+    ("InInitOrderLinks.Blink",          (0x028, "ptr")),
+    ("DllBase",                         (0x030, "ptr")),
+    ("EntryPoint",                      (0x038, "ptr")),
+    ("SizeOfImage",                     (0x040, "u32")),
+    ("FullDllName",                     (0x048, "unicode_string")),
+    ("BaseDllName",                     (0x058, "unicode_string")),
+    ("Flags",                           (0x068, "u32")),
+    ("LoadCount",                       (0x06c, "u16")),
+    ("TlsIndex",                        (0x06e, "u16")),
+    ("TimeDateStamp",                   (0x080, "u32")),
+])
+
+
+# Generic primitives — used by `dt`
+LIST_ENTRY_X64 = OrderedDict([
+    ("Flink",                           (0x000, "ptr")),
+    ("Blink",                           (0x008, "ptr")),
+])
+
+UNICODE_STRING_X64 = OrderedDict([
+    ("Length",                          (0x000, "u16")),
+    ("MaximumLength",                   (0x002, "u16")),
+    ("Buffer",                          (0x008, "ptr")),
+])
+
+
 # ---------------------------------------------------------------------------
 # Thread basic info  (NtQueryInformationThread → ThreadBasicInformation)
 # ---------------------------------------------------------------------------

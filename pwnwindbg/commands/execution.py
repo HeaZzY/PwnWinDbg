@@ -136,6 +136,27 @@ def cmd_finish(debugger, args):
     return debugger.do_finish()
 
 
+def cmd_stepuntil(debugger, args):
+    """Run until <addr>: stepuntil <addr|symbol|expression>
+
+    Sets a one-shot breakpoint at the resolved address and continues.
+    Useful for skipping ahead to a known location without single-stepping.
+    """
+    from ..core.debugger import DebuggerState
+    if debugger.state != DebuggerState.STOPPED:
+        error("Process is not stopped")
+        return None
+    if not args.strip():
+        error("Usage: stepuntil <address|symbol|expression>")
+        return None
+    from ..utils.addr_expr import eval_expr
+    addr = eval_expr(debugger, args.strip())
+    if addr is None:
+        error(f"Cannot resolve: {args.strip()}")
+        return None
+    return debugger.do_stepuntil(addr)
+
+
 def cmd_bp(debugger, args):
     """Set breakpoint: bp <address> [if <condition>]
 

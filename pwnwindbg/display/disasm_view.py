@@ -12,13 +12,16 @@ _HEX_IMM_RE = re.compile(r'\b0x([0-9a-fA-F]{4,})\b')
 
 
 def display_disasm(instructions, current_ip, symbol_resolver=None, count=10,
-                   ret_addr=None, target_insns=None, imm_resolver=None):
+                   ret_addr=None, target_insns=None, imm_resolver=None,
+                   call_args=None):
     """Display disassembly in pwndbg style.
 
     imm_resolver:  callable(int) -> str or None
                    Resolves an immediate value to a descriptive annotation
                    (e.g. '"hello"', 'ch72.exe+0x1000', pointer info).
     target_insns:  instructions at the ret/jmp target, shown after a separator.
+    call_args:     list of (name, value, annotation) tuples to render under
+                   the call instruction at current_ip. None to disable.
     """
     banner("DISASM")
 
@@ -43,6 +46,9 @@ def display_disasm(instructions, current_ip, symbol_resolver=None, count=10,
     for addr, size, mnemonic, op_str in main_insns:
         _print_insn(addr, size, mnemonic, op_str, current_ip,
                     symbol_resolver, ret_addr, imm_resolver)
+        if (call_args and addr == current_ip
+                and is_call_instruction(mnemonic)):
+            _print_call_args(call_args)
 
     if after_insns and remaining > 0:
         sep = Text()
@@ -120,3 +126,19 @@ def _print_insn(addr, size, mnemonic, op_str, current_ip,
         text.append(annotation[0], style=annotation[1])
 
     console.print(text)
+
+
+def _print_call_args(args):
+    """Render `arg name : value (annotation)` lines under the call line."""
+    for name, val, ann in args:
+        line = Text()
+        line.append("        ", style="")
+        line.append(f"{name:5s}", style="bright_yellow")
+        line.append(" = ", style="bright_black")
+        if val is None:
+            line.append("??", style="bright_red")
+        else:
+            line.append(f"{val:#x}", style="white")
+        if ann:
+            line.append(f"  {ann}", style=SYMBOL_COLOR)
+        console.print(line)

@@ -729,27 +729,59 @@ class Debugger:
         return True
 
     def do_finish(self):
-        """Run until the current function returns (step out)."""
-        # Read return address from stack
+        """Run until the current function returns (step out).
+
+        On x64, prefers the .pdata UNWIND_INFO unwinder so we get the right
+        RA even when RIP is mid-function (rsp != saved-RA slot). Falls back
+        to the naive `[rsp]` read otherwise.
+        """
         th = self.get_active_thread_handle()
         ctx = get_context(th, self.is_wow64)
         sp = get_sp(ctx, self.is_wow64)
+        ip = get_ip(ctx, self.is_wow64)
 
-        from .memory import read_ptr
-        ret_addr = read_ptr(self.process_handle, sp, self.ptr_size)
+        from .memory import read_ptr, read_memory_safe
+
+        ret_addr = None
+        if not self.is_wow64 and self.symbols and self.symbols.modules:
+            # Use the same unwinder that powers backtrace_x64. We pass
+            # mid_prolog=True so that codes whose prolog instruction has
+            # not yet executed are NOT counted (RIP may be sitting just
+            # after a `call` into a function whose prolog hasn't run).
+            from .seh import unwind_one_frame_x64
+            def _read(addr, size):
+                return read_memory_safe(self.process_handle, addr, size)
+            try:
+                caller_rip, _ = unwind_one_frame_x64(
+                    _read, self.symbols.modules, ip, sp, mid_prolog=True,
+                )
+                if caller_rip and caller_rip > 0x10000:
+                    ret_addr = caller_rip
+            except Exception:
+                ret_addr = None
+
         if ret_addr is None:
-            # Try reading from [ebp+ptr_size] (saved return address)
+            ret_addr = read_ptr(self.process_handle, sp, self.ptr_size)
+        if ret_addr is None:
+            # Last resort: [ebp+ptr_size]
             bp_val = get_bp(ctx, self.is_wow64)
             ret_addr = read_ptr(self.process_handle, bp_val + self.ptr_size, self.ptr_size)
 
         if ret_addr:
-            # Set temporary breakpoint at return address
             self.bp_manager.add(self.process_handle, ret_addr, temporary=True)
             return self.do_continue()
-        else:
-            from ..display.formatters import error
-            error("Cannot determine return address")
-            return None
+        from ..display.formatters import error
+        error("Cannot determine return address")
+        return None
+
+    def do_stepuntil(self, target_addr):
+        """Set a temporary breakpoint at `target_addr` and continue.
+
+        Mirrors GDB's `until <location>`. The BP is one-shot — it's removed
+        as soon as it fires (handled by BreakpointManager).
+        """
+        self.bp_manager.add(self.process_handle, target_addr, temporary=True)
+        return self.do_continue()
 
     def do_retbreak(self, run_after=False):
         """Find all ret instructions in the current function and set temp BPs on them.
