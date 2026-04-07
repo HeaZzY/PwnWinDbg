@@ -44,6 +44,7 @@ from .ntcalls_cmds import cmd_ntcalls
 from .xref_cmds import cmd_xref
 from .ftrace_cmds import cmd_ftrace
 from .call_cmds import cmd_call
+from .return_cmds import cmd_return
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -193,6 +194,7 @@ COMMANDS = {
     "ftrace":       (cmd_ftrace,    "Trace functions: ftrace on <name|glob>... | off [filter] | list"),
     "ltrace":       (cmd_ftrace,    "Alias for ftrace"),
     "call":         (cmd_call,      'Call function in target: call <func>(arg, "str", L"wstr", expr)'),
+    "return":       (cmd_return,    "Force-return from current function: return [<rax_value>]"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
