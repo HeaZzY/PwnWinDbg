@@ -32,6 +32,8 @@ from .args_cmds import cmd_args
 from .hooks_cmds import cmd_hooks
 from .handles_cmds import cmd_handles
 from .threads_cmds import cmd_threads
+from .procs_cmds import cmd_procs
+from .tls_cmds import cmd_tls
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -161,6 +163,9 @@ COMMANDS = {
     "argv":         (cmd_args,      "Alias for args"),
     "hooks":        (cmd_hooks,     "Detect IAT/inline hooks: hooks [--iat|--inline] [mod]"),
     "handles":      (cmd_handles,   "List handles: handles [--type T] [filter]"),
+    "procs":        (cmd_procs,     "List system processes: procs [filter] [--full]"),
+    "ps":           (cmd_procs,     "Alias for procs"),
+    "tls":          (cmd_tls,       "Show TLS slots: tls [--all] [<tid>]"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
