@@ -102,6 +102,11 @@ class Debugger:
         # Loaded DLL tracking for name resolution
         self._dll_handles = {}  # base_addr -> hFile
 
+        # Library-load catchpoints: substrings (case-insensitive) that, when
+        # matched against a freshly-loaded DLL's path/name, cause a stop.
+        # Populated by `catch load <pattern>` from commands/catch_cmds.py.
+        self.catch_load_patterns = []
+
         # Interrupt flag (set by Ctrl+C handler from another thread)
         self._interrupt_requested = False
 
@@ -393,6 +398,28 @@ class Debugger:
             base = info.lpBaseOfDll or 0
             name = self._get_dll_name(info.hFile, info.lpBaseOfDll, info.lpImageName, info.fUnicode)
             self._dll_handles[base] = (info.hFile, name)
+
+            # Library-load catchpoint: stop here if the loaded DLL matches
+            # any user-registered substring. We refresh the symbol table so
+            # the user's first command after the stop sees the new module.
+            if self.catch_load_patterns and name:
+                lname = name.lower()
+                for entry in self.catch_load_patterns:
+                    if entry["pattern"] in lname:
+                        entry["hit_count"] += 1
+                        self.state = DebuggerState.STOPPED
+                        try:
+                            self.symbols.refresh_modules(self.process_id)
+                        except Exception:
+                            pass
+                        return {
+                            "reason": "catch_load",
+                            "dll_name": name,
+                            "dll_base": base,
+                            "catch_id": entry["id"],
+                            "tid": event.dwThreadId,
+                        }
+
             # Refresh modules will be done when we actually stop
             self.continue_execution()
             return None
