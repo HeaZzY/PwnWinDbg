@@ -23,7 +23,7 @@ from .heap_cmds import (
     cmd_heap, cmd_chunks, cmd_bins, cmd_vis, cmd_find_chunks, cmd_segheap,
 )
 from .pdb_cmds import cmd_pdb
-from .watch_cmds import cmd_watch
+from .watch_cmds import cmd_watch, cmd_rwatch, cmd_awatch
 from .peb_cmds import cmd_peb, cmd_teb
 from .seh_cmds import cmd_seh
 from .dt_cmds import cmd_dt
@@ -101,8 +101,8 @@ COMMANDS = {
     "watch":        (cmd_watch,     "Hardware watchpoint: watch -w/-r/-x <addr> [-l N]"),
     "wp":           (cmd_watch,     "Alias for watch"),
     "watchpoint":   (cmd_watch,     "Alias for watch"),
-    "rwatch":       (cmd_watch,     "Alias for watch (GDB style — pass -r)"),
-    "awatch":       (cmd_watch,     "Alias for watch (GDB style — pass -r)"),
+    "rwatch":       (cmd_rwatch,    "Read+write watch (GDB-style): rwatch <addr> [-l N]"),
+    "awatch":       (cmd_awatch,    "Read+write watch (GDB-style): awatch <addr> [-l N]"),
     "detach":       (cmd_detach,    "Detach from process"),
     "kill":         (cmd_kill,      "Kill the debugged process"),
 

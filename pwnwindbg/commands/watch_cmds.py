@@ -27,6 +27,26 @@ from ..core.watchpoints import (
 )
 
 
+def cmd_rwatch(debugger, args):
+    """GDB-style alias: read+write watchpoint at <addr>.
+
+    `rwatch <addr>` is shorthand for `watch -r <addr>`. Length defaults
+    to 8 (matching `watch -r`).
+    """
+    return cmd_watch(debugger, f"-r {args}")
+
+
+def cmd_awatch(debugger, args):
+    """GDB-style alias: read+write watchpoint at <addr>.
+
+    GDB distinguishes `rwatch` (read-only) and `awatch` (read+write),
+    but x86 hardware can't watch reads without also catching writes —
+    DR7 only has `00 exec / 01 write / 11 r+w` and there's no `10`
+    for read-only. So both rwatch and awatch map to the same r+w slot.
+    """
+    return cmd_watch(debugger, f"-r {args}")
+
+
 def cmd_watch(debugger, args):
     """Add / list / remove hardware watchpoints (DR0-DR3)."""
     if not debugger.process_handle:
