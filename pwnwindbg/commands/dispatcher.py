@@ -1,7 +1,7 @@
 """Command dispatcher: maps user input to command handlers."""
 
 from .execution import (
-    cmd_run, cmd_attach, cmd_continue, cmd_step_into, cmd_step_over,
+    cmd_run, cmd_rerun, cmd_attach, cmd_continue, cmd_step_into, cmd_step_over,
     cmd_finish, cmd_bp, cmd_bl, cmd_bd, cmd_detach, cmd_kill, cmd_retbreak,
     cmd_bpcond, cmd_stepuntil,
 )
@@ -47,6 +47,7 @@ from .call_cmds import cmd_call
 from .return_cmds import cmd_return
 from .analyze_cmds import cmd_analyze
 from .asm_cmds import cmd_asm
+from .wt_cmds import cmd_wt
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -71,6 +72,8 @@ COMMANDS = {
     # Execution
     "run":          (cmd_run,       "Spawn a process: run <exe> [args] [< stdin_file]"),
     "r":            (cmd_run,       "Alias for run"),
+    "rerun":        (cmd_rerun,     "Re-spawn last exe with optional new args: rerun [<args>] [< stdin]"),
+    "rr":           (cmd_rerun,     "Alias for rerun"),
     "attach":       (cmd_attach,    "Attach to process: attach <pid>"),
     "continue":     (cmd_continue,  "Continue execution"),
     "c":            (cmd_continue,  "Alias for continue"),
@@ -201,6 +204,8 @@ COMMANDS = {
     "!analyze":     (cmd_analyze,   "Alias for analyze"),
     "asm":          (cmd_asm,       'Assemble & patch via Keystone: asm <addr> "mov rax, 1; ret"'),
     "assemble":     (cmd_asm,       "Alias for asm"),
+    "wt":           (cmd_wt,        "Watch & trace until function returns: wt [-l N] [-i N] [-v]"),
+    "trace":        (cmd_wt,        "Alias for wt"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
