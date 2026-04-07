@@ -105,6 +105,7 @@ PAGE_WRITECOMBINE = 0x400
 MEM_COMMIT = 0x1000
 MEM_RESERVE = 0x2000
 MEM_FREE = 0x10000
+MEM_RELEASE = 0x8000
 
 # Memory type
 MEM_PRIVATE = 0x20000
@@ -525,6 +526,12 @@ kernel32.VirtualQueryEx.restype = SIZE_T
 
 kernel32.VirtualProtectEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD, POINTER(DWORD)]
 kernel32.VirtualProtectEx.restype = BOOL
+
+kernel32.VirtualAllocEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD, DWORD]
+kernel32.VirtualAllocEx.restype = LPVOID
+
+kernel32.VirtualFreeEx.argtypes = [HANDLE, LPVOID, SIZE_T, DWORD]
+kernel32.VirtualFreeEx.restype = BOOL
 
 # Thread context
 kernel32.GetThreadContext.argtypes = [HANDLE, POINTER(CONTEXT64)]
