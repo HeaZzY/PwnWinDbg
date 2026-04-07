@@ -101,6 +101,16 @@ def handle_stop(debugger, stop_info):
         success(f"catch load #{cid}: {dll} loaded at {base:#x}")
         display_context(debugger)
 
+    elif reason == "catch_exception":
+        cid = stop_info.get("catch_id", 0)
+        code = stop_info.get("code", 0)
+        name = stop_info.get("name", f"{code:#x}")
+        addr = stop_info.get("address", 0)
+        success(
+            f"catch exception #{cid}: {code:#010x} ({name}) at {addr:#x}"
+        )
+        display_context(debugger)
+
     elif reason == "exit":
         exit_code = stop_info.get("exit_code", 0)
         warn(f"Process exited with code {exit_code}")

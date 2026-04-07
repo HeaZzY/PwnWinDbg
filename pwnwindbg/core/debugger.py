@@ -106,6 +106,9 @@ class Debugger:
         # matched against a freshly-loaded DLL's path/name, cause a stop.
         # Populated by `catch load <pattern>` from commands/catch_cmds.py.
         self.catch_load_patterns = []
+        # First-chance exception catchpoints. Each entry is a dict with
+        # `id`, `code`, `name`, `hit_count`. Populated by `catch exception`.
+        self.catch_exception_filters = []
 
         # Interrupt flag (set by Ctrl+C handler from another thread)
         self._interrupt_requested = False
@@ -635,6 +638,25 @@ class Debugger:
                 "first_chance": first_chance,
                 "tid": tid,
             }
+
+        # User-armed first-chance exception catchpoints. We do this BEFORE
+        # the generic pass-through so the user can stop on things like
+        # 0xE06D7363 (MSVC C++ throw) or division-by-zero that would
+        # otherwise be silently delivered to the application's handler.
+        if first_chance and self.catch_exception_filters:
+            for entry in self.catch_exception_filters:
+                if entry["code"] == code:
+                    entry["hit_count"] += 1
+                    self.state = DebuggerState.STOPPED
+                    return {
+                        "reason": "catch_exception",
+                        "code": code,
+                        "name": entry["name"],
+                        "catch_id": entry["id"],
+                        "address": addr,
+                        "first_chance": True,
+                        "tid": tid,
+                    }
 
         # Other exceptions
         if first_chance:
