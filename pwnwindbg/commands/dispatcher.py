@@ -31,6 +31,7 @@ from .errno_cmds import cmd_errno
 from .args_cmds import cmd_args
 from .hooks_cmds import cmd_hooks
 from .handles_cmds import cmd_handles
+from .threads_cmds import cmd_threads
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -173,7 +174,9 @@ COMMANDS = {
     "ed":           (cmd_ed,        "Edit dwords (WinDbg)"),
     "eq":           (cmd_eq,        "Edit qwords (WinDbg)"),
     "bc":           (cmd_bc,        "Clear breakpoint(s) (WinDbg): bc <id|*>"),
-    "~":            (cmd_thread_list, "List threads (WinDbg)"),
+    "~":            (cmd_threads,   "List threads (WinDbg-style)"),
+    "threads":      (cmd_threads,   "List threads (TEB/IP/name); thread <tid> to switch"),
+    "thread":       (cmd_threads,   "Switch active thread: thread <tid>"),
     "g":            (cmd_continue,  "Go (WinDbg alias for continue)"),
     "t":            (cmd_step_into, "Trace (WinDbg alias for step into)"),
     "k":            (lambda d, a: (display_context(d), None)[1], "Backtrace (alias for context)"),
