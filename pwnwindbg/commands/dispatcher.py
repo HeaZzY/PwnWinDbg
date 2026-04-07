@@ -27,6 +27,9 @@ from .watch_cmds import cmd_watch
 from .peb_cmds import cmd_peb, cmd_teb
 from .seh_cmds import cmd_seh
 from .dt_cmds import cmd_dt
+from .errno_cmds import cmd_errno
+from .args_cmds import cmd_args
+from .hooks_cmds import cmd_hooks
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -150,6 +153,11 @@ COMMANDS = {
     "teb":          (cmd_teb,       "Show TEB: teb [-v|<tid>|all]"),
     "seh":          (cmd_seh,       "SEH inspection: seh [chain|here|module <name>|all]"),
     "dt":           (cmd_dt,        "Display struct type: dt [_STRUCT] [addr]"),
+    "errno":        (cmd_errno,     "Show active thread's GetLastError"),
+    "gle":          (cmd_errno,     "Alias for errno (GetLastError)"),
+    "args":         (cmd_args,      "Show argv / cmdline / cwd / image path"),
+    "argv":         (cmd_args,      "Alias for args"),
+    "hooks":        (cmd_hooks,     "Detect IAT/inline hooks: hooks [--iat|--inline] [mod]"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
