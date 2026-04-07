@@ -40,6 +40,7 @@ from .dprintf_cmds import cmd_dprintf
 from .session_cmds import cmd_session
 from .catch_cmds import cmd_catch
 from .syscalls_cmds import cmd_syscalls
+from .ntcalls_cmds import cmd_ntcalls
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -182,6 +183,8 @@ COMMANDS = {
     "catch":        (cmd_catch,     "Event catchpoint: catch load <substring> | list | del <id>"),
     "syscalls":     (cmd_syscalls,  "Trace ntdll!Nt* via tracing BPs: syscalls on [filter] | off | list"),
     "strace":       (cmd_syscalls,  "Alias for syscalls"),
+    "ntcalls":      (cmd_ntcalls,   "NT syscall # <-> name table: ntcalls table [filter] | num <NN> | name <Nt>"),
+    "ssn":          (cmd_ntcalls,   "Alias for ntcalls"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),

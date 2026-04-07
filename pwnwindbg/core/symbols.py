@@ -413,6 +413,11 @@ class SymbolManager:
         self._exports_loaded = False
         self._export_by_name.clear()
         self._export_by_addr.clear()
+        # Drop the cached NT syscall table — it's tied to live ntdll bytes,
+        # so a fresh attach/respawn means a (possibly) different ntdll base
+        # and stub locations.
+        if hasattr(self, "_nt_syscall_table"):
+            self._nt_syscall_table.invalidate()
 
         # Sync DbgHelp's internal module list with the live process so it
         # knows about every DLL we've seen via LOAD_DLL events.
