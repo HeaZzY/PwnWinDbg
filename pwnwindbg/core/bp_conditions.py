@@ -72,6 +72,9 @@ def build_namespace(debugger):
         "int":   int,
         "len":   len,
         "True":  True, "False": False, "None": None,
+        # Process / thread ids — handy in dprintf/syscall traces.
+        "tid":   debugger.active_thread_id or 0,
+        "pid":   debugger.process_id or 0,
     })
     return ns
 

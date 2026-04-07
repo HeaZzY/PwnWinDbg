@@ -39,6 +39,7 @@ from .vmprot_cmds import cmd_vmprot
 from .dprintf_cmds import cmd_dprintf
 from .session_cmds import cmd_session
 from .catch_cmds import cmd_catch
+from .syscalls_cmds import cmd_syscalls
 from .windbg_cmds import (
     cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
     cmd_eb, cmd_ew, cmd_ed, cmd_eq,
@@ -179,6 +180,8 @@ COMMANDS = {
     "tprintf":      (cmd_dprintf,   "Alias for dprintf"),
     "session":      (cmd_session,   "Save/load BPs+WPs: session save|load|show [path]"),
     "catch":        (cmd_catch,     "Event catchpoint: catch load <substring> | list | del <id>"),
+    "syscalls":     (cmd_syscalls,  "Trace ntdll!Nt* via tracing BPs: syscalls on [filter] | off | list"),
+    "strace":       (cmd_syscalls,  "Alias for syscalls"),
 
     # WinDbg-style aliases
     "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
