@@ -6,11 +6,15 @@ Commands:
     bins [heap_addr]        — show free bins/buckets
     vis [heap_addr]         — visual heap layout (like pwndbg)
     find-chunks <criteria>  — search for specific chunks
+    segheap [heap_addr]     — inspect a Win10/11 _SEGMENT_HEAP
 """
 
 import struct
 
-from ..core.heap import WindowsHeapAnalyzer, HeapType, ChunkState, HEAP_ENTRY_SIZE
+from ..core.heap import (
+    WindowsHeapAnalyzer, HeapType, ChunkState, HEAP_ENTRY_SIZE,
+    SEGMENT_HEAP_SIGNATURE,
+)
 from ..core.memory import read_memory_safe
 from ..display.formatters import (
     error, info, success, warn, console, banner,
@@ -190,6 +194,8 @@ def cmd_vis(debugger, args):
     start_addr = None
     target_heap = None
 
+    from ..utils.addr_expr import eval_expr
+
     parts = args.strip().split()
     i = 0
     while i < len(parts):
@@ -211,17 +217,15 @@ def cmd_vis(debugger, args):
             if i + 1 >= len(parts):
                 error("--from requires an address")
                 return None
-            try:
-                start_addr = int(parts[i + 1], 0)
-            except ValueError:
-                error(f"Invalid address: {parts[i + 1]}")
+            start_addr = eval_expr(debugger, parts[i + 1])
+            if start_addr is None:
+                error(f"Cannot resolve address: {parts[i + 1]}")
                 return None
             i += 2
         else:
-            try:
-                target_heap = int(a, 0)
-            except ValueError:
-                error(f"Invalid argument: {a}")
+            target_heap = eval_expr(debugger, a)
+            if target_heap is None:
+                error(f"Cannot resolve heap address: {a}")
                 return None
             i += 1
 
@@ -445,6 +449,8 @@ def _display_visual_heap(debugger, chunks, heap_info, total_chunks):
 
     Each row: <addr>  <qword1>  <qword2>  <ascii>
     Free chunks are bright_red, busy chunks cycle through a color palette.
+    Within a single chunk, runs of 3+ identical 16-byte rows are collapsed
+    into a single "* (N identical rows)" line, GDB-style.
     """
     console.print(
         f"[bright_black]vis: {heap_info.name} @ {heap_info.address:#x} "
@@ -465,17 +471,59 @@ def _display_visual_heap(debugger, chunks, heap_info, total_chunks):
             color = _VIS_COLORS[color_idx % len(_VIS_COLORS)]
             color_idx += 1
 
+        # Group consecutive identical 16-byte rows
+        rows = []
         for off in range(0, len(raw), 16):
             line = raw[off:off + 16]
             if len(line) < 16:
                 line = line + b"\x00" * (16 - len(line))
-            line_addr = header_addr + off
+            rows.append((header_addr + off, line))
+
+        n = len(rows)
+        i = 0
+        while i < n:
+            line_addr, line = rows[i]
+            # Look ahead for identical rows
+            j = i + 1
+            while j < n and rows[j][1] == line:
+                j += 1
+            run_len = j - i
+
+            # Always print the first row of the run
             q1 = struct.unpack("<Q", line[:8])[0]
             q2 = struct.unpack("<Q", line[8:16])[0]
             ascii_repr = "".join(chr(b) if 32 <= b < 127 else "." for b in line)
             console.print(
                 f"[{color}]{line_addr:#018x}  {q1:#018x}  {q2:#018x}  {ascii_repr}[/]"
             )
+
+            if run_len >= 3:
+                # Skip the middle, print the marker, then the last row of the run
+                # so the user still sees where the pattern ends.
+                console.print(
+                    f"[bright_black]* {run_len - 2} identical row(s) "
+                    f"({(run_len - 2) * 16:#x} bytes)[/]"
+                )
+                last_addr, last_line = rows[j - 1]
+                lq1 = struct.unpack("<Q", last_line[:8])[0]
+                lq2 = struct.unpack("<Q", last_line[8:16])[0]
+                lascii = "".join(chr(b) if 32 <= b < 127 else "." for b in last_line)
+                console.print(
+                    f"[{color}]{last_addr:#018x}  {lq1:#018x}  {lq2:#018x}  {lascii}[/]"
+                )
+                i = j
+            elif run_len == 2:
+                # Print the second one too — collapsing 2 saves nothing
+                second_addr, second_line = rows[i + 1]
+                sq1 = struct.unpack("<Q", second_line[:8])[0]
+                sq2 = struct.unpack("<Q", second_line[8:16])[0]
+                sascii = "".join(chr(b) if 32 <= b < 127 else "." for b in second_line)
+                console.print(
+                    f"[{color}]{second_addr:#018x}  {sq1:#018x}  {sq2:#018x}  {sascii}[/]"
+                )
+                i = j
+            else:
+                i = j
 
 
 def _show_all_chunks(analyzer):
@@ -491,3 +539,117 @@ def _show_all_chunks(analyzer):
             console.print()
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# segheap — Win10/11 _SEGMENT_HEAP inspection
+# ---------------------------------------------------------------------------
+
+def cmd_segheap(debugger, args):
+    """Inspect a _SEGMENT_HEAP (Win10+ default for some processes).
+
+    Usage:
+        segheap                 — show all detected segment heaps
+        segheap <addr>          — show one specific heap address
+        segheap <addr> --large  — also walk LargeAllocMetadata RB tree
+    """
+    if not debugger.process_id:
+        error("No process attached")
+        return None
+
+    parts = args.strip().split()
+    target = None
+    show_large = False
+    for p in parts:
+        if p == "--large":
+            show_large = True
+            continue
+        try:
+            target = int(p, 0)
+        except ValueError:
+            from ..utils.addr_expr import eval_expr
+            target = eval_expr(debugger, p)
+            if target is None:
+                error(f"Invalid heap address: {p}")
+                return None
+
+    analyzer = WindowsHeapAnalyzer(debugger)
+
+    targets = []
+    if target is not None:
+        targets = [target]
+    else:
+        for h in analyzer.detect_heaps():
+            if h.heap_type == HeapType.SEGMENT:
+                targets.append(h.address)
+        if not targets:
+            warn("No segment heaps detected in process")
+            info("Win11's default heap is segment-heap-only for processes "
+                 "with the appropriate manifest. test_heap.exe uses NT heap.")
+            return None
+
+    for addr in targets:
+        info_obj = analyzer.read_segment_heap(addr)
+        if info_obj is None:
+            error(f"No _SEGMENT_HEAP at {addr:#x} "
+                  f"(signature mismatch — expected {SEGMENT_HEAP_SIGNATURE:#x})")
+            continue
+        _display_segment_heap(info_obj)
+        if show_large:
+            allocs = analyzer.walk_segment_large_allocs(addr)
+            _display_large_allocs(allocs, addr)
+    return None
+
+
+def _display_segment_heap(info_obj):
+    """Print _SEGMENT_HEAP header fields."""
+    banner(f"SEGMENT HEAP @ {info_obj.address:#x}")
+    table = Table(show_header=True, border_style="cyan",
+                  header_style="bold bright_white")
+    table.add_column("Field", style="bold bright_white")
+    table.add_column("Value", style="bright_cyan")
+    table.add_column("Note", style="bright_black")
+
+    table.add_row("Signature", f"{info_obj.signature:#x}",
+                  "OK" if info_obj.signature == SEGMENT_HEAP_SIGNATURE else "MISMATCH")
+    table.add_row("GlobalFlags", f"{info_obj.global_flags:#x}", "")
+    table.add_row("Interceptor", f"{info_obj.interceptor:#x}",
+                  "non-zero = page heap or hooked" if info_obj.interceptor else "")
+    table.add_row("ProcessHeapListIndex",
+                  f"{info_obj.process_heap_list_index}", "")
+    table.add_row("LargeReservedPages",
+                  f"{info_obj.large_reserved_pages:#x}",
+                  f"= {info_obj.large_reserved_pages * 0x1000} bytes")
+    table.add_row("LargeCommittedPages",
+                  f"{info_obj.large_committed_pages:#x}",
+                  f"= {info_obj.large_committed_pages * 0x1000} bytes")
+    console.print(table)
+    info("Backend / VS / LFH chunk walking is not supported (per-context "
+         "encoded headers vary across builds). Use `segheap <addr> --large` "
+         "to walk the LargeAllocMetadata RB tree.")
+
+
+def _display_large_allocs(allocs, heap_addr):
+    """Print large allocations from a segment heap."""
+    if not allocs:
+        warn(f"No large allocations in segment heap {heap_addr:#x}")
+        return
+
+    banner(f"LARGE ALLOCATIONS in segment heap {heap_addr:#x} ({len(allocs)})")
+    table = Table(show_header=True, border_style="cyan",
+                  header_style="bold bright_white")
+    table.add_column("#", justify="right", style="bright_yellow")
+    table.add_column("Address", style="bright_cyan")
+    table.add_column("Size", justify="right", style="bright_white")
+    table.add_column("UserSize", justify="right", style="bright_green")
+    table.add_column("Metadata", style="bright_black")
+
+    for i, a in enumerate(allocs):
+        table.add_row(
+            str(i),
+            f"{a['address']:#x}",
+            f"{a['size']:#x}",
+            f"{a['user_size']:#x}",
+            f"{a['metadata_addr']:#x}",
+        )
+    console.print(table)

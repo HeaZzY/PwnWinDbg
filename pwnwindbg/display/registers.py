@@ -13,6 +13,18 @@ from ..core.registers import (
 )
 
 
+def _display_name(name):
+    """Map an internal CONTEXT field name to its display form (lowercase).
+
+    The dict-key form (e.g. 'Rax') is mandated by the ctypes CONTEXT
+    Structure, so we keep it everywhere internally and only lowercase at
+    the rendering boundary. EFlags becomes 'eflags', SegCs becomes 'cs'.
+    """
+    if name.startswith("Seg"):
+        return name[3:].lower()
+    return name.lower()
+
+
 def _get_reg_color(name, is_changed):
     if is_changed:
         return REG_COLOR_CHANGED
@@ -63,7 +75,7 @@ def display_registers(regs, changed, is_wow64, symbol_resolver=None):
         val_str = ptr_fmt.format(val)
 
         text = Text()
-        text.append(f" {name:6s}", style=color)
+        text.append(f" {_display_name(name):6s}", style=color)
         text.append(" ")
         text.append(val_str, style=color)
 
@@ -79,7 +91,7 @@ def display_registers(regs, changed, is_wow64, symbol_resolver=None):
         eflags = regs["EFlags"]
         color = _get_reg_color("EFlags", "EFlags" in changed)
         text = Text()
-        text.append(f" {'EFlags':6s}", style=color)
+        text.append(f" {'eflags':6s}", style=color)
         text.append(f" 0x{eflags:08x}", style=color)
         text.append(f"  [{_format_eflags(eflags)}]", style="bright_black")
         console.print(text)
@@ -89,7 +101,7 @@ def display_registers(regs, changed, is_wow64, symbol_resolver=None):
     seg_vals = []
     for s in seg_names:
         if s in regs:
-            seg_vals.append(f"{s[3:].lower()}={regs[s]:#06x}")
+            seg_vals.append(f"{_display_name(s)}={regs[s]:#06x}")
     if seg_vals:
         text = Text()
         text.append("  ", style="")

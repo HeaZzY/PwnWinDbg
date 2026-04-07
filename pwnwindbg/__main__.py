@@ -61,6 +61,23 @@ def handle_stop(debugger, stop_info):
     elif reason == "single_step":
         display_context(debugger)
 
+    elif reason == "watchpoint":
+        wp = stop_info.get("wp")
+        addr = stop_info.get("address", 0)
+        if wp:
+            from .core.watchpoints import WATCH_WRITE, WATCH_READ_WRITE, WATCH_EXEC
+            label = {WATCH_WRITE: "write", WATCH_READ_WRITE: "read+write",
+                     WATCH_EXEC: "exec"}[wp.access]
+            sym = debugger.symbols.resolve_address(wp.address) or ""
+            sym_str = f" ({sym})" if sym else ""
+            success(
+                f"Watchpoint #{wp.id} hit: {label} @ {wp.address:#x}{sym_str}  "
+                f"rip={addr:#x}  hits={wp.hit_count}"
+            )
+        else:
+            info(f"Hardware watchpoint hit at {addr:#x}")
+        display_context(debugger)
+
     elif reason == "access_violation":
         addr = stop_info.get("address", 0)
         access = stop_info.get("access_type", "unknown")

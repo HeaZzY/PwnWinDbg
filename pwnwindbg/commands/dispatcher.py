@@ -3,6 +3,7 @@
 from .execution import (
     cmd_run, cmd_attach, cmd_continue, cmd_step_into, cmd_step_over,
     cmd_finish, cmd_bp, cmd_bl, cmd_bd, cmd_detach, cmd_kill, cmd_retbreak,
+    cmd_bpcond,
 )
 from .examine import parse_x_command
 from .info_cmds import (
@@ -18,8 +19,18 @@ from .nav_cmds import (
     cmd_xinfo, cmd_distance, cmd_entry, cmd_hexdump, cmd_print,
 )
 from .rop_cmds import cmd_rop
-from .heap_cmds import cmd_heap, cmd_chunks, cmd_bins, cmd_vis, cmd_find_chunks
+from .heap_cmds import (
+    cmd_heap, cmd_chunks, cmd_bins, cmd_vis, cmd_find_chunks, cmd_segheap,
+)
 from .pdb_cmds import cmd_pdb
+from .watch_cmds import cmd_watch
+from .peb_cmds import cmd_peb, cmd_teb
+from .seh_cmds import cmd_seh
+from .windbg_cmds import (
+    cmd_db, cmd_dw, cmd_dd, cmd_dq, cmd_da, cmd_du,
+    cmd_eb, cmd_ew, cmd_ed, cmd_eq,
+    cmd_bc, cmd_thread_list,
+)
 from .kd_cmds import (
     cmd_kdconnect, cmd_kddisconnect, cmd_kdregs, cmd_kdmem, cmd_kdwrite,
     cmd_kdbp, cmd_kdbpd, cmd_kdcontinue, cmd_kdstep, cmd_kdstepover,
@@ -68,8 +79,15 @@ COMMANDS = {
     "bd":           (cmd_bd,        "Delete breakpoint: bd <id>"),
     "del":          (cmd_bd,        "Alias for bd"),
     "delete":       (cmd_bd,        "Alias for bd"),
+    "cond":         (cmd_bpcond,    "Set condition on a BP: cond <id> [<expr>]"),
+    "condition":    (cmd_bpcond,    "Alias for cond"),
     "retbreak":     (cmd_retbreak,  "Break on all ret in current function, then continue"),
     "rb":           (cmd_retbreak,  "Alias for retbreak"),
+    "watch":        (cmd_watch,     "Hardware watchpoint: watch -w/-r/-x <addr> [-l N]"),
+    "wp":           (cmd_watch,     "Alias for watch"),
+    "watchpoint":   (cmd_watch,     "Alias for watch"),
+    "rwatch":       (cmd_watch,     "Alias for watch (GDB style — pass -r)"),
+    "awatch":       (cmd_watch,     "Alias for watch (GDB style — pass -r)"),
     "detach":       (cmd_detach,    "Detach from process"),
     "kill":         (cmd_kill,      "Kill the debugged process"),
 
@@ -112,6 +130,7 @@ COMMANDS = {
     "bins":         (cmd_bins,      "Show free bins: bins [heap_addr]"),
     "vis":          (cmd_vis,       "Visual heap layout: vis [heap_addr] [--compact]"),
     "find-chunks":  (cmd_find_chunks, "Find chunks: find-chunks --size <n> [--free] [--contains <str>]"),
+    "segheap":      (cmd_segheap,   "Inspect _SEGMENT_HEAP: segheap [addr] [--large]"),
 
     # Info
     "info":         (cmd_info,      "Info commands: info <proc|maps|modules|functions>"),
@@ -122,6 +141,29 @@ COMMANDS = {
     "modules":      (cmd_modules,   "List loaded modules"),
     "functions":    (cmd_functions, "List functions: functions [filter]"),
     "funcs":        (cmd_functions, "Alias for functions"),
+
+    # PEB / TEB
+    "peb":          (cmd_peb,       "Show PEB: peb [-v|modules|env|params]"),
+    "teb":          (cmd_teb,       "Show TEB: teb [-v|<tid>|all]"),
+    "seh":          (cmd_seh,       "SEH inspection: seh [chain|here|module <name>|all]"),
+
+    # WinDbg-style aliases
+    "db":           (cmd_db,        "Display bytes (WinDbg): db <addr> [Lcount]"),
+    "dw":           (cmd_dw,        "Display words (WinDbg)"),
+    "dd":           (cmd_dd,        "Display dwords (WinDbg)"),
+    "dq":           (cmd_dq,        "Display qwords (WinDbg)"),
+    "da":           (cmd_da,        "Display ASCII string (WinDbg)"),
+    "du":           (cmd_du,        "Display Unicode string (WinDbg)"),
+    "eb":           (cmd_eb,        "Edit bytes (WinDbg): eb <addr> <byte>..."),
+    "ew":           (cmd_ew,        "Edit words (WinDbg)"),
+    "ed":           (cmd_ed,        "Edit dwords (WinDbg)"),
+    "eq":           (cmd_eq,        "Edit qwords (WinDbg)"),
+    "bc":           (cmd_bc,        "Clear breakpoint(s) (WinDbg): bc <id|*>"),
+    "~":            (cmd_thread_list, "List threads (WinDbg)"),
+    "g":            (cmd_continue,  "Go (WinDbg alias for continue)"),
+    "t":            (cmd_step_into, "Trace (WinDbg alias for step into)"),
+    "k":            (lambda d, a: (display_context(d), None)[1], "Backtrace (alias for context)"),
+    "heaps":        (cmd_heap,      "Alias for heap"),
 
     # Symbols / PDB
     "pdb":          (cmd_pdb,       "PDB symbols: pdb [status|path|cache|load <module|all>]"),
@@ -286,9 +328,13 @@ _USERLAND_HELP = {
         ("kill / detach",         "Terminate / detach process"),
     ],
     "Breakpoints": [
-        ("bp / b / break <addr>", "Set software breakpoint (supports *addr)"),
+        ("bp <addr> [if <expr>]", "Set software BP (supports *addr, conditions)"),
+        ("cond <id> [<expr>]",    "Add/clear condition on existing BP"),
         ("bl / i b",              "List breakpoints"),
         ("bd / del <id>",         "Delete breakpoint"),
+        ("watch -w/-r/-x <addr>", "Hardware watchpoint (DR0-DR3) [-l 1/2/4/8]"),
+        ("watch / wp",            "List active watchpoints"),
+        ("watch del <id>",        "Remove watchpoint  (watch clear → all)"),
     ],
     "Display / context": [
         ("context / ctx",         "Full pwndbg-style context (regs+disasm+stack+bt)"),
@@ -327,6 +373,7 @@ _USERLAND_HELP = {
         ("bins [heap_addr]",      "Show free bins/buckets by size"),
         ("vis [heap_addr]",       "Visual heap layout (pwndbg-style)"),
         ("find-chunks <criteria>","Search chunks by size/state/content"),
+        ("segheap [addr] [--large]", "Inspect Win10/11 _SEGMENT_HEAP header"),
     ],
     "Info": [
         ("info proc",             "Process info (PID, path, arch)"),
@@ -335,6 +382,9 @@ _USERLAND_HELP = {
         ("funcs / info functions","List exports/imports"),
         ("checksec [path]",       "PE mitigations (ASLR/DEP/CFG/SEH/...)"),
         ("iat / got [path]",      "Import Address Table"),
+        ("peb [-v|modules|env|params]", "Process Environment Block"),
+        ("teb [-v|<tid>|all]",    "Thread Environment Block"),
+        ("seh [chain|here|module]", "SEH chain / .pdata handler at RIP"),
     ],
 }
 

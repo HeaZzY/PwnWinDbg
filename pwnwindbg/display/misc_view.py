@@ -32,6 +32,8 @@ def display_breakpoints(bps):
         text.append(f"  hits={bp.hit_count}", style="bright_black")
         if bp.temporary:
             text.append("  [temp]", style="bright_yellow")
+        if getattr(bp, "condition", None):
+            text.append(f"  if {bp.condition}", style="bright_cyan")
         console.print(text)
 
 

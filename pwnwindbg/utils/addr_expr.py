@@ -4,8 +4,10 @@ Supports expressions like:
     0x401000
     0x401000+0x10
     0x401000-1
-    eax
+    eax        — bare register name
+    $rax       — GDB-style register prefix (same as bare)
     eax+8
+    $rsp-0x18
     ntdll+0x1000
     ntdll.dll+0x1000
     ch72.exe+0x1347-1
@@ -76,11 +78,22 @@ def _resolve_token(debugger, token):
     if not token:
         return None
 
-    # Hex / decimal literal
-    try:
-        return int(token, 0)
-    except ValueError:
-        pass
+    # GDB-style register prefix: $rax, $rip, ... — strip the $ and the
+    # token must resolve as a register, not a symbol/literal.
+    is_dollar_reg = False
+    if token.startswith("$"):
+        token = token[1:]
+        is_dollar_reg = True
+        if not token:
+            return None
+
+    # Hex / decimal literal (only when there was no $ prefix — $0x10 makes
+    # no sense and we don't want to silently swallow it).
+    if not is_dollar_reg:
+        try:
+            return int(token, 0)
+        except ValueError:
+            pass
 
     # Register name
     from ..core.debugger import DebuggerState
@@ -90,6 +103,11 @@ def _resolve_token(debugger, token):
             for k, v in regs.items():
                 if k.lower() == token.lower():
                     return v
+
+    # If the user explicitly asked for a register ($prefix) we don't fall
+    # back to symbol lookup — that would mask typos.
+    if is_dollar_reg:
+        return None
 
     # Symbol / module via symbol manager
     resolved = debugger.symbols.resolve_name_to_address(token)

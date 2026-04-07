@@ -137,30 +137,87 @@ def cmd_finish(debugger, args):
 
 
 def cmd_bp(debugger, args):
-    """Set breakpoint: bp <address>"""
+    """Set breakpoint: bp <address> [if <condition>]
+
+    Examples:
+        bp 0x401000
+        bp WinExec
+        bp *0x401000+0x10
+        bp 0x401000 if rax == 0x42
+        bp WinExec if qword(rsp+8) == 0x4141414141414141
+    """
     from .kd_cmds import _kd_session
     if _kd_session and _kd_session.connected:
         from .kd_cmds import cmd_kdbp
         return cmd_kdbp(debugger, args)
     args = args.strip()
     if not args:
-        error("Usage: bp <address|symbol>")
+        error("Usage: bp <address|symbol> [if <condition>]")
         return None
 
+    # Split off "if <condition>" tail
+    condition = None
+    addr_part = args
+    # Use a token-aware split: look for the keyword `if` surrounded by spaces
+    tokens = args.split()
+    for i, tok in enumerate(tokens):
+        if tok.lower() == "if" and i > 0:
+            addr_part = " ".join(tokens[:i])
+            condition = " ".join(tokens[i + 1:])
+            if not condition:
+                error("Empty condition after `if`")
+                return None
+            break
+
     # Strip GDB-style '*' prefix
-    if args.startswith("*"):
-        args = args[1:].strip()
+    if addr_part.startswith("*"):
+        addr_part = addr_part[1:].strip()
 
     # Try to resolve address (supports expressions like addr+0x10)
     from ..utils.addr_expr import eval_expr
-    addr = eval_expr(debugger, args)
+    addr = eval_expr(debugger, addr_part)
     if addr is None:
-        error(f"Cannot resolve: {args}")
+        error(f"Cannot resolve: {addr_part}")
         return None
 
     bp = debugger.bp_manager.add(debugger.process_handle, addr)
     debugger.bp_manager.save_address(addr)
-    success(f"Breakpoint #{bp.id} set at {addr:#x}")
+    if condition is not None:
+        bp.condition = condition
+        success(f"Breakpoint #{bp.id} set at {addr:#x} if {condition}")
+    else:
+        success(f"Breakpoint #{bp.id} set at {addr:#x}")
+    return None
+
+
+def cmd_bpcond(debugger, args):
+    """Set or clear a condition on an existing breakpoint.
+
+    Usage: cond <id> [<expression>]
+           cond <id>            — clear the condition
+           cond <id> rax == 0x42 — set condition
+    """
+    args = args.strip()
+    parts = args.split(None, 1)
+    if not parts:
+        error("Usage: cond <bp_id> [<expression>]")
+        return None
+    try:
+        bp_id = int(parts[0], 0)
+    except ValueError:
+        error(f"Invalid breakpoint id: {parts[0]}")
+        return None
+    bp = debugger.bp_manager.bp_by_id.get(bp_id)
+    if bp is None:
+        error(f"No breakpoint with id {bp_id}")
+        return None
+    expr = parts[1].strip() if len(parts) > 1 else ""
+    if not expr:
+        bp.condition = None
+        success(f"Breakpoint #{bp_id}: condition cleared")
+    else:
+        bp.condition = expr
+        success(f"Breakpoint #{bp_id}: condition set to `{expr}`")
     return None
 
 

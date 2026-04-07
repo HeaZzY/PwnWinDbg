@@ -601,8 +601,9 @@ def display_kd_context(session=None):
             val = regs[name]
             color = _reg_color(name, name in changed)
 
+            display_name = name[3:].lower() if name.startswith("Seg") else name.lower()
             text = Text()
-            text.append(f" {name:6s}", style=color)
+            text.append(f" {display_name:6s}", style=color)
             text.append(" ")
             text.append(ptr_fmt.format(val), style=color)
 
@@ -644,7 +645,7 @@ def display_kd_context(session=None):
             ]
             flags = [n for bit, n in flag_defs if eflags & (1 << bit)]
             text = Text()
-            text.append(f" {'EFlags':6s}", style=color)
+            text.append(f" {'eflags':6s}", style=color)
             text.append(f" 0x{eflags:08x}", style=color)
             text.append(f"  [{' '.join(flags)}]", style="bright_black")
             console.print(text)

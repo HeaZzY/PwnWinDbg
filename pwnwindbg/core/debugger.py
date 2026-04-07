@@ -30,6 +30,7 @@ from .registers import (
     context_to_dict, diff_registers,
 )
 from .breakpoints import BreakpointManager
+from .watchpoints import WatchpointManager
 from .symbols import SymbolManager
 from .disasm import create_disassembler, disassemble_at
 
@@ -68,6 +69,12 @@ class Debugger:
 
         # Breakpoint management
         self.bp_manager = BreakpointManager()
+
+        # Hardware watchpoint management (DR0-DR3)
+        self.wp_manager = WatchpointManager()
+        # Set when an EXCEPTION_SINGLE_STEP is the result of a watchpoint
+        # rather than a user single-step.
+        self._last_wp_hit = None
 
         # Disassembler
         self.disassembler = None
@@ -355,6 +362,10 @@ class Debugger:
         elif code == CREATE_THREAD_DEBUG_EVENT:
             info = event.u.CreateThread
             self.threads[tid] = info.hThread
+            # Re-arm watchpoints on the new thread (debug regs are
+            # per-thread so a freshly created thread starts with DR7=0).
+            if self.wp_manager.list_all():
+                self.apply_watchpoints_to_thread(info.hThread)
             self.continue_execution()
             return None
 
@@ -456,15 +467,60 @@ class Debugger:
                 self._step_over_bp = bp
                 self.state = DebuggerState.STOPPED
 
+                # Conditional breakpoint: if condition evaluates to false,
+                # silently single-step past the BP and continue running.
+                if bp.condition:
+                    from .bp_conditions import evaluate_condition
+                    ok, truthy, err = evaluate_condition(self, bp.condition)
+                    if not ok:
+                        from ..display.formatters import warn
+                        warn(f"BP#{bp.id} condition error: {err}")
+                        # Treat eval errors as a real stop so the user notices
+                    elif not truthy:
+                        # Step over the BP, then continue (re_enable_after_single_step
+                        # will fire on the SINGLE_STEP exception below).
+                        self._single_stepping = False
+                        set_trap_flag(ctx)
+                        set_context(th, ctx, self.is_wow64)
+                        self.continue_execution()
+                        return self.run_until_stop()
+
                 return {"reason": "breakpoint", "bp": bp, "address": bp_addr, "tid": tid}
             else:
                 # Not our breakpoint — could be another system BP, pass through
                 self.continue_execution()
                 return None
 
-        # Single step
+        # Single step  — also the entry path for hardware watchpoints,
+        # which the CPU reports as a SINGLE_STEP exception with the
+        # responsible slot indicated by DR6 bits B0..B3.
         if code in (EXCEPTION_SINGLE_STEP, STATUS_WX86_SINGLE_STEP):
             self.state = DebuggerState.STOPPED
+
+            # ---- Watchpoint check (must come before user-step handling) ----
+            if self.wp_manager.list_all():
+                th = self.get_active_thread_handle()
+                if th:
+                    try:
+                        ctx = get_context(th, self.is_wow64)
+                        dr6 = ctx.Dr6
+                        wp = self.wp_manager.hit_slot(dr6)
+                        if wp:
+                            # Clear B0..B3 in DR6 so the next read is clean.
+                            ctx.Dr6 = dr6 & ~0xF
+                            # Set RF so the next instruction doesn't re-trip
+                            # an exec watchpoint at the same address.
+                            set_resume_flag(ctx)
+                            set_context(th, ctx, self.is_wow64)
+                            self._last_wp_hit = wp
+                            return {
+                                "reason": "watchpoint",
+                                "wp": wp,
+                                "address": get_ip(ctx, self.is_wow64),
+                                "tid": tid,
+                            }
+                    except Exception:
+                        pass
 
             # Re-enable breakpoint we just stepped over
             if self._step_over_bp:
@@ -616,6 +672,61 @@ class Debugger:
 
         # Not a call, just single-step
         return self.do_step_into()
+
+    # -----------------------------------------------------------------
+    # Hardware watchpoints
+    # -----------------------------------------------------------------
+
+    def apply_watchpoints_to_thread(self, thread_handle):
+        """Push the current watchpoint slot state into one thread's CONTEXT.
+
+        Idempotent — safe to call multiple times. Used both when arming a
+        new watchpoint (push to every existing thread) and when a new
+        thread is created mid-run (push current state to it).
+        """
+        if not thread_handle:
+            return False
+        try:
+            ctx = get_context(thread_handle, self.is_wow64)
+        except Exception:
+            return False
+
+        addrs = self.wp_manager.slot_addresses()
+        ctx.Dr0 = addrs[0]
+        ctx.Dr1 = addrs[1]
+        ctx.Dr2 = addrs[2]
+        ctx.Dr3 = addrs[3]
+        ctx.Dr6 = 0
+        ctx.Dr7 = self.wp_manager.build_dr7()
+        try:
+            set_context(thread_handle, ctx, self.is_wow64)
+            return True
+        except Exception:
+            return False
+
+    def apply_watchpoints_to_all_threads(self):
+        """Push current watchpoint state into every known thread."""
+        applied = 0
+        for th in self.threads.values():
+            if self.apply_watchpoints_to_thread(th):
+                applied += 1
+        return applied
+
+    def add_watchpoint(self, address, access, length):
+        """Allocate a hardware watchpoint and arm it on every thread.
+
+        Returns the new Watchpoint or raises ValueError on failure.
+        """
+        wp = self.wp_manager.add(address, access, length)
+        self.apply_watchpoints_to_all_threads()
+        return wp
+
+    def remove_watchpoint(self, wp_id):
+        """Remove a watchpoint by id and re-arm remaining slots on all threads."""
+        if not self.wp_manager.remove_by_id(wp_id):
+            return False
+        self.apply_watchpoints_to_all_threads()
+        return True
 
     def do_finish(self):
         """Run until the current function returns (step out)."""

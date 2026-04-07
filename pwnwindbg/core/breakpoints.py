@@ -19,10 +19,15 @@ class Breakpoint:
         self.enabled = True
         self.hit_count = 0
         self.temporary = False  # For internal use (e.g., finish command)
+        # Conditional BP: optional Python expression evaluated each hit.
+        # If set and evaluates to a falsy value, the debugger silently
+        # continues. See core/bp_conditions.py for the eval namespace.
+        self.condition = None
 
     def __repr__(self):
         state = "enabled" if self.enabled else "disabled"
-        return f"BP#{self.id} @ {self.address:#x} ({state}, hits={self.hit_count})"
+        cond = f" if {self.condition}" if self.condition else ""
+        return f"BP#{self.id} @ {self.address:#x} ({state}, hits={self.hit_count}){cond}"
 
 
 class BreakpointManager:

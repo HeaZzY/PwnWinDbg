@@ -32,7 +32,14 @@ def _parse_x_args(args, debugger):
         return None, None
 
     addr_str = parts[0]
-    count = int(parts[1]) if len(parts) > 1 else 16
+    if len(parts) > 1:
+        try:
+            count = int(parts[1], 0)
+        except ValueError:
+            error(f"Invalid count: {parts[1]}")
+            return None, None
+    else:
+        count = 16
 
     # For KD mode, try parsing as hex directly if eval_expr fails
     addr = eval_expr(debugger, addr_str)

@@ -6,8 +6,11 @@ using the documented (public-symbol-derived) _HEAP / _HEAP_SEGMENT layout.
 Supports:
 - NT Heap (HeapAlloc/HeapFree via ntdll.dll) — full chunk walking with
   encoded HEAP_ENTRY decode (XOR with _HEAP.Encoding)
-- Segment Heap (Win10+) — detection only; chunk walking is a TODO since
-  the segment heap structures are far less stable than NT heap.
+- Segment Heap (Win10+) — detection plus large-allocation walking via the
+  RTL_RB_TREE rooted in _SEGMENT_HEAP.LargeAllocMetadata. Backend / VS / LFH
+  small chunk walking is *not* implemented because those allocators rely on
+  per-context XOR-encoded headers whose offsets shift across builds. We
+  expose the high-level _SEGMENT_HEAP fields instead.
 
 Linux-style malloc chunks: msvcrt/ucrt malloc on Windows is a thin wrapper
 over HeapAlloc on the process default heap, so the chunks you allocate with
@@ -36,6 +39,42 @@ PEB_PROCESS_HEAPS_OFFSET = 0xF0     # PEB.ProcessHeaps (PVOID*)
 # ---- _HEAP / _HEAP_SEGMENT signatures ----
 NT_HEAP_SIGNATURE = 0xFFEEFFEE       # _HEAP_SEGMENT.SegmentSignature
 SEGMENT_HEAP_SIGNATURE = 0xDDEEDDEE  # _SEGMENT_HEAP.Signature
+
+# ---- _SEGMENT_HEAP layout (Win10/11 x64, common offsets) ----
+# Public symbol layout from a recent Win11 ntdll PDB. Stable across most
+# 19041+ builds, but may shift slightly on earlier 1809-era builds.
+#   +0x000 Signature                ULONG  (0xddeeddee)
+#   +0x004 GlobalFlags              ULONG
+#   +0x008 Interceptor              ULONG
+#   +0x00c ProcessHeapListIndex     USHORT
+#   +0x00e GlobalLockCount          USHORT
+#   +0x010 GlobalLockOwner          ULONG
+#   +0x018 LargeMetadataLock        RTL_SRWLOCK
+#   +0x020 LargeAllocMetadata       RTL_RB_TREE     (Root, Min)
+#   +0x030 LargeReservedPages       SIZE_T
+#   +0x038 LargeCommittedPages      SIZE_T
+SEGHEAP_SIGNATURE_OFF        = 0x000
+SEGHEAP_GLOBAL_FLAGS_OFF     = 0x004
+SEGHEAP_INTERCEPTOR_OFF      = 0x008
+SEGHEAP_PROCESS_INDEX_OFF    = 0x00c
+SEGHEAP_LARGE_RB_ROOT_OFF    = 0x020   # RTL_RB_TREE.Root
+SEGHEAP_LARGE_RB_MIN_OFF     = 0x028   # RTL_RB_TREE.Min
+SEGHEAP_LARGE_RESERVED_OFF   = 0x030
+SEGHEAP_LARGE_COMMITTED_OFF  = 0x038
+
+# ---- _HEAP_LARGE_ALLOC_DATA layout (x64) ----
+# Each large allocation has a metadata record reachable through the RB tree.
+#   +0x000 TreeNode             RTL_BALANCED_NODE  (Left/Right/ParentValue)
+#   +0x018 VirtualAddress       PVOID  (top bits encode AllocatedPages)
+#   +0x020 UnusedBytes          USHORT
+#   +0x022 ExtraPresent         bit
+#   +0x024 Spare                : 11
+#   +0x026 GuardPageCount       : 1
+#   +0x028 AllocatedPages       SIZE_T   (in 0x1000 units; alt path)
+LARGE_ALLOC_TREE_NODE_OFF    = 0x000
+LARGE_ALLOC_VA_OFF           = 0x018
+LARGE_ALLOC_UNUSED_BYTES_OFF = 0x020
+LARGE_ALLOC_PAGES_OFF        = 0x028
 
 # ---- _HEAP layout (Win10/11 x64, validated against live data) ----
 # _HEAP starts with a _HEAP_SEGMENT (size 0x70), then:
@@ -141,6 +180,24 @@ class HeapInfo:
     @property
     def lfh_enabled(self) -> bool:
         return self.heap_type == HeapType.NT_HEAP and (self.flags & 0x2) != 0
+
+
+@dataclass
+class SegmentHeapInfo:
+    """High-level fields read from a _SEGMENT_HEAP header."""
+    address: int
+    signature: int
+    global_flags: int
+    interceptor: int
+    process_heap_list_index: int
+    large_reserved_pages: int
+    large_committed_pages: int
+    large_alloc_count: int = 0
+    large_allocs: list = None  # List[dict] populated by walk_segment_large_allocs
+
+    def __post_init__(self):
+        if self.large_allocs is None:
+            self.large_allocs = []
 
 
 class WindowsHeapAnalyzer:
@@ -432,6 +489,88 @@ class WindowsHeapAnalyzer:
             if not chunk.data or needle not in chunk.data:
                 return False
         return True
+
+    # ---- Segment Heap inspection ----
+
+    def read_segment_heap(self, heap_addr: int) -> Optional[SegmentHeapInfo]:
+        """Read the high-level _SEGMENT_HEAP header fields.
+
+        Returns None if the address doesn't carry the segment-heap signature.
+        Use walk_segment_large_allocs() to populate the .large_allocs list.
+        """
+        sig = self._read_u32(heap_addr + SEGHEAP_SIGNATURE_OFF)
+        if sig != SEGMENT_HEAP_SIGNATURE:
+            return None
+
+        return SegmentHeapInfo(
+            address=heap_addr,
+            signature=sig,
+            global_flags=self._read_u32(heap_addr + SEGHEAP_GLOBAL_FLAGS_OFF),
+            interceptor=self._read_u32(heap_addr + SEGHEAP_INTERCEPTOR_OFF),
+            process_heap_list_index=self._read_u16(heap_addr + SEGHEAP_PROCESS_INDEX_OFF),
+            large_reserved_pages=self._read_ptr(heap_addr + SEGHEAP_LARGE_RESERVED_OFF),
+            large_committed_pages=self._read_ptr(heap_addr + SEGHEAP_LARGE_COMMITTED_OFF),
+        )
+
+    def walk_segment_large_allocs(self, heap_addr: int, max_count: int = 4096):
+        """Walk the LargeAllocMetadata RB tree of a segment heap.
+
+        Returns a list of dicts {address, size, unused_bytes, metadata_addr}.
+        Each entry corresponds to a single VirtualAlloc-backed allocation.
+
+        The RB tree root is at SEGHEAP_LARGE_RB_ROOT_OFF; nodes are
+        RTL_BALANCED_NODE { Left, Right, ParentValue }. Each node is the
+        TreeNode field of a HEAP_LARGE_ALLOC_DATA at offset 0, so the metadata
+        record address equals the node address.
+        """
+        root = self._read_ptr(heap_addr + SEGHEAP_LARGE_RB_ROOT_OFF)
+        if not root:
+            return []
+
+        out = []
+        # Iterative in-order traversal with a manual stack
+        stack = []
+        node = root
+        seen = set()
+        while (node or stack) and len(out) < max_count:
+            while node and node not in seen:
+                if len(seen) > max_count * 4:
+                    return out
+                seen.add(node)
+                stack.append(node)
+                left = self._read_ptr(node + 0x00)  # RTL_BALANCED_NODE.Left
+                if not left or left in seen:
+                    break
+                node = left
+
+            if not stack:
+                break
+            node = stack.pop()
+
+            # node is the TreeNode field at offset 0 of HEAP_LARGE_ALLOC_DATA
+            meta_addr = node
+            va_raw = self._read_ptr(meta_addr + LARGE_ALLOC_VA_OFF)
+            unused = self._read_u16(meta_addr + LARGE_ALLOC_UNUSED_BYTES_OFF)
+            pages = self._read_ptr(meta_addr + LARGE_ALLOC_PAGES_OFF)
+
+            # The bottom 12 bits of VirtualAddress can hold flags; mask to page
+            user_va = va_raw & ~0xFFF
+            total_size = pages * 0x1000 if pages else 0
+            user_size = max(0, total_size - unused) if total_size else 0
+
+            if user_va and total_size and total_size < (1 << 40):
+                out.append({
+                    "address": user_va,
+                    "size": total_size,
+                    "user_size": user_size,
+                    "unused_bytes": unused,
+                    "metadata_addr": meta_addr,
+                })
+
+            right = self._read_ptr(node + 0x08)  # RTL_BALANCED_NODE.Right
+            node = right if right and right not in seen else None
+
+        return out
 
     def invalidate(self):
         self._heap_cache.clear()
