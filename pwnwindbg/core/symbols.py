@@ -438,7 +438,16 @@ class SymbolManager:
             return False
 
     def _ensure_exports_loaded(self):
-        """Parse PE exports for all loaded modules (lazy, done once per refresh)."""
+        """Parse PE exports for all loaded modules (lazy, done once per refresh).
+
+        Forwarded exports (e.g. kernel32!HeapAlloc → kernelbase!HeapAlloc →
+        ntdll!RtlAllocateHeap) are detected and chased to their final
+        implementation. Without this, pefile's RVA for a forwarder points
+        inside the export name table — placing a BP there fires zero times
+        because no thread ever lands inside the export directory. The user
+        cares about the *real* address, not the forwarder thunk that the
+        loader has long since IAT-rewritten away.
+        """
         if self._exports_loaded:
             return
         self._exports_loaded = True
@@ -446,6 +455,14 @@ class SymbolManager:
             import pefile
         except ImportError:
             return
+
+        # First pass: collect every export. For real (non-forwarded) exports
+        # we already know the runtime address. For forwarders we record the
+        # `DLL.FUNC` chain target so the second pass can resolve it.
+        # Maps: (mod_name_lower, func_name_lower) -> entry
+        # entry = ("real", mod_name, func_name, runtime_addr)
+        #       | ("fwd",  mod_name, func_name, fwd_dll, fwd_func)
+        per_module = {}
         for mod in self.modules:
             if not mod.path or not os.path.isfile(mod.path):
                 continue
@@ -461,22 +478,88 @@ class SymbolManager:
                     if not exp.name:
                         continue
                     func_name = exp.name.decode('utf-8', errors='replace')
-                    rva = exp.address
-                    runtime_addr = mod.base_address + rva
-                    key = func_name.lower()
-                    self._export_by_name[key] = (mod.name, func_name, runtime_addr)
-                    # Also store with module prefix for "module!func" lookups
-                    mod_key = f"{mod.name.lower()}!{key}"
-                    self._export_by_name[mod_key] = (mod.name, func_name, runtime_addr)
-                    # Without extension too
-                    stem = mod.name.lower().rsplit('.', 1)[0] if '.' in mod.name else mod.name.lower()
-                    stem_key = f"{stem}!{key}"
-                    if stem_key != mod_key:
-                        self._export_by_name[stem_key] = (mod.name, func_name, runtime_addr)
-                    self._export_by_addr[runtime_addr] = (mod.name, func_name)
+                    fwd = getattr(exp, "forwarder", None)
+                    if fwd:
+                        try:
+                            fwd_str = fwd.decode("utf-8", errors="replace")
+                        except Exception:
+                            continue
+                        if "." not in fwd_str:
+                            continue
+                        next_mod, next_func = fwd_str.split(".", 1)
+                        per_module[(mod.name.lower(), func_name.lower())] = (
+                            "fwd", mod.name, func_name, next_mod, next_func
+                        )
+                    else:
+                        runtime_addr = mod.base_address + exp.address
+                        per_module[(mod.name.lower(), func_name.lower())] = (
+                            "real", mod.name, func_name, runtime_addr
+                        )
                 pe.close()
             except Exception:
                 continue
+
+        # Helper: resolve a (mod, func) entry through any forwarder chain.
+        # Returns (real_mod_name, real_func_name, real_addr) or None.
+        def _resolve(mod_l, func_l, depth):
+            if depth > 16:
+                return None
+            entry = per_module.get((mod_l, func_l))
+            if entry is None:
+                return None
+            kind = entry[0]
+            if kind == "real":
+                return (entry[1], entry[2], entry[3])
+            # Forwarder — try a few mod-name spellings.
+            _, _, _, fwd_dll, fwd_func = entry
+            cands = [
+                fwd_dll.lower() + ".dll",
+                fwd_dll.lower(),
+                f"{fwd_dll.lower()}.dll".lower(),
+            ]
+            seen = set()
+            for cand in cands:
+                if cand in seen:
+                    continue
+                seen.add(cand)
+                resolved = _resolve(cand, fwd_func.lower(), depth + 1)
+                if resolved is not None:
+                    return resolved
+            return None
+
+        # Second pass: emit one cache entry per (mod, func), chasing
+        # forwarders. Bare-name keys (`heapalloc`) win on the first
+        # encountered REAL implementation — that way, when the user types
+        # `bp HeapAlloc` we hand them the ntdll!RtlAllocateHeap address
+        # rather than the kernel32 thunk.
+        bare_seen = set()
+        for (mod_l, func_l), entry in per_module.items():
+            resolved = _resolve(mod_l, func_l, 0)
+            if resolved is None:
+                continue
+            real_mod, real_func, real_addr = resolved
+            # Always store the qualified key for the *original* module so
+            # `kernel32!HeapAlloc` and `kernelbase!HeapAlloc` both resolve
+            # to the chased ntdll address.
+            orig_mod = entry[1]
+            orig_func = entry[2]
+            mod_key = f"{orig_mod.lower()}!{orig_func.lower()}"
+            self._export_by_name[mod_key] = (real_mod, real_func, real_addr)
+            stem = orig_mod.lower().rsplit('.', 1)[0] if '.' in orig_mod else orig_mod.lower()
+            stem_key = f"{stem}!{orig_func.lower()}"
+            if stem_key != mod_key:
+                self._export_by_name[stem_key] = (real_mod, real_func, real_addr)
+            # Bare-name entry: only set on the first hit so the chased
+            # address wins for `HeapAlloc`-style lookups. (kernel32 happens
+            # to be early in self.modules but we don't rely on order — we
+            # check via `bare_seen` below.)
+            bare_key = orig_func.lower()
+            if bare_key not in bare_seen:
+                bare_seen.add(bare_key)
+                self._export_by_name[bare_key] = (real_mod, real_func, real_addr)
+            # addr -> name lookup (only for real, non-forwarded entries)
+            if entry[0] == "real":
+                self._export_by_addr[entry[3]] = (orig_mod, orig_func)
 
     def resolve_address(self, address):
         """Resolve an address to 'module!symbol' or 'module+offset'.
@@ -554,6 +637,16 @@ class SymbolManager:
         except ValueError:
             pass
 
+        # Try the PE export cache first. It already chased forwarder chains
+        # at load time, so for names like `HeapAlloc` it returns the real
+        # ntdll!RtlAllocateHeap address — DbgHelp would hand us the kernel32
+        # forwarder thunk instead, which is never executed at runtime.
+        self._ensure_exports_loaded()
+        key = name.strip().lower()
+        hit = self._export_by_name.get(key)
+        if hit:
+            return hit[2]  # runtime_addr
+
         # Try DbgHelp SymFromName (handles 'module!symbol' and bare symbol)
         addr = self._resolve_sym_by_name(name)
         if addr is not None:
@@ -565,13 +658,6 @@ class SymbolManager:
                 addr = self._resolve_sym_by_name(f"{mod.name}!{name}")
                 if addr is not None:
                     return addr
-
-        # Try PE export cache (covers all loaded DLL exports)
-        self._ensure_exports_loaded()
-        key = name.strip().lower()
-        hit = self._export_by_name.get(key)
-        if hit:
-            return hit[2]  # runtime_addr
 
         # Bare module name → base address
         name_lower = name.strip().lower()

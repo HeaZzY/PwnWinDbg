@@ -139,11 +139,11 @@ def _expand_targets(debugger, name):
           across the PE export cache (case-insensitive). The leading
           `module!` qualifier, if present, restricts matches to that
           module.
-        - a literal address / symbol → resolved by searching PE exports
-          first (so we land on the *implementation* module, not a kernel32
-          forwarder thunk that the loader bypassed via IAT redirection),
-          and falling back to `eval_expr` for things like `0x401000`,
-          `module+0x10`, or DbgHelp-only symbols.
+        - a literal address / symbol → resolved via `eval_expr`, which
+          consults the PE export cache first (so forwarder chains like
+          kernel32!HeapAlloc → ntdll!RtlAllocateHeap are pre-chased and
+          we land on the real implementation, not a thunk the loader
+          IAT-rewrote away).
 
     Returns a list of (display_label, runtime_addr) tuples. Empty list
     if nothing resolved.
@@ -151,29 +151,6 @@ def _expand_targets(debugger, name):
     if any(ch in name for ch in "*?["):
         return _expand_glob(debugger, name)
 
-    # Qualified name: let eval_expr handle module!func directly. The
-    # explicit prefix already disambiguates the module the user wanted.
-    if "!" in name:
-        addr = eval_expr(debugger, name)
-        if addr is None:
-            return []
-        label = (
-            debugger.symbols.resolve_address(addr) if debugger.symbols else None
-        ) or name
-        return [(label, addr)]
-
-    # Unqualified name: search the PE export cache across every module.
-    # On Win10+, kernel32 exports HeapAlloc/CloseHandle/etc. as forwarders
-    # to kernelbase, and DbgHelp may resolve the bare name to a kernel32
-    # thunk address that the IAT-rewritten loader never actually calls
-    # (so a BP there fires zero times). The PE export cache, by contrast,
-    # contains the real implementation address for each module that
-    # actually carries the symbol.
-    matches = _exact_export_matches(debugger, name)
-    if matches:
-        return matches
-
-    # Fallback: hex literal, module+offset, or a DbgHelp-only symbol.
     addr = eval_expr(debugger, name)
     if addr is None:
         return []
@@ -183,143 +160,14 @@ def _expand_targets(debugger, name):
     return [(label, addr)]
 
 
-def _exact_export_matches(debugger, name):
-    """Return [(label, addr)] for every module exporting `name` exactly,
-    chasing forwarders down to the real implementation.
-
-    On Win10+, both kernel32!HeapAlloc and kernelbase!HeapAlloc are
-    forwarders that ultimately resolve to ntdll!RtlAllocateHeap. pefile's
-    RVA for a forwarded export points inside the export name table — not
-    a real function entry — so a BP placed there fires zero times. We
-    detect this case by re-parsing the PE file for the matching module
-    and following the `forwarder` chain until we find a non-forwarded
-    export or hit a missing module.
-    """
-    if not debugger.symbols:
-        return []
-    debugger.symbols._ensure_exports_loaded()
-    target = name.lower()
-
-    # First pass: collect every module whose export table mentions `name`.
-    candidates = []
-    seen_mods = set()
-    for key, (mod_name, func_name, _addr) in debugger.symbols._export_by_name.items():
-        if "!" in key:
-            continue
-        if func_name.lower() != target:
-            continue
-        if mod_name in seen_mods:
-            continue
-        seen_mods.add(mod_name)
-        candidates.append((mod_name, func_name))
-
-    # For each candidate, follow the forwarder chain to a real address.
-    # Use a *fresh* visited set per chain so the depth guard only applies
-    # within a single forwarder hop sequence, not across independent
-    # candidates.
-    out = []
-    seen_addrs = set()
-    for mod_name, func_name in candidates:
-        resolved = _chase_forwarder(debugger, mod_name, func_name, set())
-        if resolved is None:
-            continue
-        impl_mod, impl_name, impl_addr = resolved
-        if impl_addr in seen_addrs:
-            continue
-        seen_addrs.add(impl_addr)
-        out.append((f"{impl_mod}!{impl_name}", impl_addr))
-    return out
-
-
-def _chase_forwarder(debugger, mod_name, func_name, visited):
-    """Follow `mod_name!func_name` through any forwarder chain.
-
-    Returns (real_module_name, real_func_name, real_runtime_addr) or
-    None if the chain dead-ends (missing module, broken export table,
-    or unbounded loop).
-    """
-    try:
-        import pefile
-    except ImportError:
-        return None
-
-    key = f"{mod_name.lower()}!{func_name.lower()}"
-    if key in visited:
-        return None
-    visited.add(key)
-    if len(visited) > 16:
-        return None  # depth guard against pathological forwarder loops
-
-    mod = None
-    for m in debugger.symbols.modules:
-        if m.name.lower() == mod_name.lower():
-            mod = m
-            break
-    if mod is None or not mod.path:
-        return None
-
-    try:
-        pe = pefile.PE(mod.path, fast_load=True)
-        pe.parse_data_directories(
-            directories=[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_EXPORT']]
-        )
-    except Exception:
-        return None
-    if not hasattr(pe, "DIRECTORY_ENTRY_EXPORT"):
-        pe.close()
-        return None
-
-    target = func_name.lower()
-    for exp in pe.DIRECTORY_ENTRY_EXPORT.symbols:
-        if not exp.name:
-            continue
-        if exp.name.decode("utf-8", errors="replace").lower() != target:
-            continue
-        # Forwarded export: parse "DLL.FUNC" / "DLL.#ord" and recurse.
-        fwd = getattr(exp, "forwarder", None)
-        if fwd:
-            pe.close()
-            try:
-                fwd_str = fwd.decode("utf-8", errors="replace")
-            except Exception:
-                return None
-            if "." not in fwd_str:
-                return None
-            next_mod, next_func = fwd_str.split(".", 1)
-            # Forwarder strings are bare DLL names without extension; the
-            # loaded module list uses the full filename, so try a few
-            # candidates (`ntdll.dll`, `ntdll`, etc.).
-            cand_names = [
-                f"{next_mod}.dll",
-                next_mod,
-                next_mod.lower() + ".dll",
-                next_mod.lower(),
-            ]
-            for cand in cand_names:
-                resolved = _chase_forwarder(
-                    debugger, cand, next_func, visited
-                )
-                if resolved is not None:
-                    return resolved
-            return None
-        # Real export: compute the runtime address from base + RVA.
-        addr = mod.base_address + exp.address
-        pe.close()
-        return (mod.name, func_name, addr)
-
-    pe.close()
-    return None
-
-
 def _expand_glob(debugger, pattern):
     """Match a glob (with optional `module!` prefix) against PE exports.
 
-    Each match is then chased through any forwarder chain so the resulting
-    BP lands on the real implementation. Without this, a glob like
-    `kernelbase!Heap*` resolves HeapAlloc/HeapFree/HeapReAlloc/HeapSize to
-    kernelbase RVAs that are themselves forwarders to ntdll!Rtl* — placing
-    a BP at those raw RVAs fires zero times because no thread ever lands
-    inside the export name table.
+    Iterates the *qualified* (`module!func`) entries in the export cache
+    so each (module, func) pair is visible. Each entry's value already
+    points at the chased real implementation, so a `kernelbase!Heap*`
+    glob resolves HeapAlloc/HeapFree/etc. to ntdll!Rtl* directly without
+    us needing to re-walk the forwarder chain here.
     """
     if not debugger.symbols:
         return []
@@ -334,28 +182,16 @@ def _expand_glob(debugger, pattern):
     func_pat_l = func_pat.lower()
     out = []
     seen_addrs = set()
-    seen_pairs = set()
-    for key, (mod_name, func_name, _addr) in debugger.symbols._export_by_name.items():
-        if "!" in key:
-            continue  # iterate the bare-name keys only
-        mod_l = mod_name.lower()
+    for key, (impl_mod, impl_name, impl_addr) in debugger.symbols._export_by_name.items():
+        if "!" not in key:
+            continue  # iterate the qualified keys, one per (orig_mod, orig_func)
+        orig_mod, orig_func = key.split("!", 1)
         if mod_filter:
-            stem = mod_l.rsplit(".", 1)[0] if "." in mod_l else mod_l
-            if mod_l != mod_filter and stem != mod_filter:
+            stem = orig_mod.rsplit(".", 1)[0] if "." in orig_mod else orig_mod
+            if orig_mod != mod_filter and stem != mod_filter:
                 continue
-        if not fnmatch.fnmatchcase(func_name.lower(), func_pat_l):
+        if not fnmatch.fnmatchcase(orig_func, func_pat_l):
             continue
-        pair_key = (mod_l, func_name.lower())
-        if pair_key in seen_pairs:
-            continue
-        seen_pairs.add(pair_key)
-        # Fresh visited set per chain — the depth guard inside
-        # _chase_forwarder is meant to bound a single forwarder sequence,
-        # not accumulate across all matches of a glob.
-        resolved = _chase_forwarder(debugger, mod_name, func_name, set())
-        if resolved is None:
-            continue
-        impl_mod, impl_name, impl_addr = resolved
         if impl_addr in seen_addrs:
             continue
         seen_addrs.add(impl_addr)
