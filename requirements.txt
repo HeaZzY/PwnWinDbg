@@ -2,3 +2,4 @@ pywin32>=306
 capstone>=5.0
 pefile>=2023.2.7
 rich>=13.0
+cryptography>=41.0

@@ -58,6 +58,10 @@ def _get_target_insns(debugger, insns, current_ip, ret_addr):
 
 def cmd_regs(debugger, args):
     """Show registers: regs"""
+    from .kd_cmds import _kd_session
+    if _kd_session and _kd_session.connected:
+        from .kd_cmds import cmd_kdregs
+        return cmd_kdregs(debugger, args)
     regs, changed = debugger.get_registers()
     if not regs:
         error("Cannot read registers")
@@ -72,6 +76,10 @@ def cmd_regs(debugger, args):
 
 def cmd_disasm(debugger, args):
     """Disassemble at address: disasm [addr] [count]"""
+    from .kd_cmds import _kd_session
+    if _kd_session and _kd_session.connected:
+        from .kd_cmds import cmd_kddisasm
+        return cmd_kddisasm(debugger, args)
     from ..core.debugger import DebuggerState
     if debugger.state not in (DebuggerState.STOPPED,) and not args.strip():
         error("No process stopped. Use: disasm <address> [count]")

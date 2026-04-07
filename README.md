@@ -15,6 +15,7 @@ pwnWinDbg brings the UX and workflow of [pwndbg](https://github.com/pwndbg/pwndb
 
 ## Features
 
+### Userland
 - **pwndbg-style context** — registers, disassembly, stack, and backtrace in a single view
 - **GDB-compatible commands** — `x/`, `si`, `ni`, `bp`, `set`, `finish`, etc.
 - **Telescope / pointer chains** — dereference pointers recursively, annotate strings and executable addresses
@@ -25,6 +26,20 @@ pwnWinDbg brings the UX and workflow of [pwndbg](https://github.com/pwndbg/pwndb
 - **Address expressions** — use `rax+0x10`, `ntdll+0x1000`, `rsp-8` anywhere an address is expected
 - **Persistent breakpoints** — survive re-run and re-attach
 - **WoW64 support** — debug 32-bit processes on 64-bit Windows
+
+### Kernel mode (x64)
+- **QEMU GDB stub transport** — connect to a Windows VM running under QEMU/KVM with `-s`/`-gdb tcp:...`
+- **Process / thread / token enumeration** — walks `PsActiveProcessHead` and `EPROCESS.ThreadListHead` to list processes, threads and tokens (PID, PPID, name, EPROCESS, Token, DTB)
+- **Token stealing primitive** — `kdtoken steal <src> <dst>` patches `EPROCESS.Token` to elevate a target process; `kdtoken shellcode` emits a self-contained x64 stealer
+- **Dynamic struct offset extraction** — disassembles stable `nt!Ps*` exports (`PsGetProcessId`, `PsGetProcessImageFileName`, `PsGetCurrentProcessId`, `PsGetCurrentThreadId`) at runtime to recover EPROCESS / KTHREAD / ETHREAD field offsets, no per-build hardcoded tables
+- **Page-table walker** — `kdpte <vaddr>` follows PML4 → PDPT → PD → PT, detects 1 GB / 2 MB large pages, prints physical address
+- **Kernel region classifier** — `kdxinfo` tags any kernel address as `ntoskrnl`, `pool`, `KUSER_SHARED_DATA`, etc.
+- **Heuristic stack backtrace** — `kdbt` scans `RSP` for `call`-validated return addresses and resolves them to module+offset
+- **WinDbg-style struct view** — `kddt _EPROCESS [addr]` prints field layout, populated dynamically from extracted offsets
+- **Kernel memory search** — `kdsearch -s|-x|-p [--module M]` across loaded driver images
+- **Kernel `lm`** — list loaded drivers via `PsLoadedModuleList`, with name/regex filter
+- **Kernel breakpoints, single-step, register dump, mem read/write** via the GDB RSP backend
+- **Kernel `checksec`** — reports SMEP / SMAP / NX / KPTI / kernel CET / KVA shadow status from `CR0`/`CR4`/`EFER`
 
 ## Requirements
 
@@ -41,6 +56,8 @@ pip install -r requirements.txt
 
 ## Usage
 
+### Userland
+
 ```bash
 # Launch a process
 python -m pwnwindbg target.exe
@@ -53,6 +70,42 @@ python -m pwnwindbg --attach <pid>
 # Or use the wrapper
 python main.py target.exe
 ```
+
+### Kernel debugging (QEMU GDB stub only — for now)
+
+> **Status:** Only the **QEMU GDB stub** transport is implemented and tested today.
+> The KDNET (UDP) and named-pipe (`kdcom`) backends listed in the help are stubs and **do not work yet**.
+
+Boot a Windows VM under QEMU/KVM with the GDB stub enabled:
+
+```bash
+qemu-system-x86_64 \
+    -m 4G -smp 2 -enable-kvm \
+    -drive file=win10.qcow2,if=virtio \
+    -s                       # equivalent to: -gdb tcp::1234
+    # ...or pick your own port:
+    # -gdb tcp::10000
+```
+
+Then attach pwnWinDbg from the host:
+
+```bash
+python -m pwnwindbg
+pwnWinDbg> kdconnect gdb:localhost:10000
+pwnWinDbg> lm                       # list loaded drivers
+pwnWinDbg> kdps                     # walk processes
+pwnWinDbg> kdthreads 4              # threads of System
+pwnWinDbg> kdtoken                  # list tokens
+pwnWinDbg> kdtoken steal 4 1234     # copy SYSTEM token to PID 1234
+pwnWinDbg> kdpte 0xfffff80206ea3000 # walk page tables
+pwnWinDbg> kddt _EPROCESS           # show struct layout
+pwnWinDbg> kdc                      # continue
+pwnWinDbg> kddisconnect
+```
+
+Physical-memory reads (used by `kdpte`) require QEMU's monitor to be reachable
+on the same TCP socket — pwnWinDbg multiplexes `xp /Nbx` requests over the
+QEMU GDB RSP `qRcmd` channel, so no extra `-monitor` flag is needed.
 
 ## Commands
 
@@ -145,6 +198,58 @@ python main.py target.exe
 | `xinfo <addr>` | | Detailed address info |
 | `distance <a> <b>` | | Offset between two addresses |
 
+### Kernel Debugging
+
+> Currently only `kdconnect gdb:host:port` is functional. The `net:` and `pipe:` forms are placeholders.
+
+#### Connection / control
+
+| Command | Description |
+|---------|-------------|
+| `kdconnect gdb:host:port` | Connect to a QEMU GDB stub (e.g. `gdb:localhost:10000`) |
+| `kddisconnect` | Disconnect from the kernel target |
+| `kdversion` | Target version, build number (from `KUSER_SHARED_DATA`), bitness |
+| `kdbreak` | Interrupt a running kernel |
+| `kdc` / `kdcontinue` | Resume kernel execution |
+| `kdsi` / `kdstep` | Single-step (step into) |
+| `kdni` | Step over (skip `call`) |
+
+#### Memory / registers / breakpoints
+
+| Command | Description |
+|---------|-------------|
+| `kdregs` | Show kernel registers (with telescope) |
+| `kdmem <addr> [size]` | Hex dump of kernel memory |
+| `kdwrite <addr> <hex>` | Write kernel memory |
+| `kddisasm [addr] [n]` / `kdu` | Disassemble kernel code |
+| `kdbp <addr>` / `kdbpd <addr>` | Set / clear kernel breakpoint |
+| `kddbgprint` | Show captured `DbgPrint` output |
+| `kdchecksec` / `checksec` | SMEP / SMAP / NX / KPTI / CET / KVA-shadow status |
+
+#### Modules / processes / tokens
+
+| Command | Description |
+|---------|-------------|
+| `lm` / `kdlm [m] [filter]` | List loaded drivers (`PsLoadedModuleList`) |
+| `kdps [filter]` | Walk `ActiveProcessLinks`, list processes |
+| `kdthreads <pid\|name>` | List threads of a process |
+| `kdtoken` | List process tokens (raw `EX_FAST_REF` + addr + refcnt) |
+| `kdtoken steal <src> <dst>` | Copy a token from src process to dst (4 = SYSTEM) |
+| `kdtoken shellcode` | Print x64 token-stealing shellcode template |
+
+#### Navigation / analysis
+
+| Command | Description |
+|---------|-------------|
+| `kdbt [max] [scan]` | Heuristic kernel backtrace (call-validated stack scan) |
+| `kdxinfo <addr>` | Classify a kernel address (module / pool / KUSER_SHARED_DATA / …) |
+| `kdsearch -s\|-x\|-p [--module M]` | Search kernel memory for a string / hex pattern / pointer |
+| `kdpte <vaddr>` | Walk page tables (PML4 → PDPT → PD → PT), print physical address |
+| `kddt <_STRUCT> [addr]` / `dt` | WinDbg-style struct view (currently `_EPROCESS`) |
+
+Both `kdconnect ... gdb:` accepts the WinDbg `nt`/`ntkrnl`/`ntkrnlmp` aliases in
+expressions (e.g. `kdxinfo nt+0x1000`).
+
 ### Address Expressions
 
 All commands accepting addresses support arithmetic expressions:
@@ -182,14 +287,31 @@ pwnwindbg/
 │   ├── cyclic_cmds.py       # De Bruijn patterns
 │   ├── rop_cmds.py          # ROP gadget finder
 │   ├── info_cmds.py         # Process/module info
-│   └── nav_cmds.py          # xinfo, distance, entry
+│   ├── nav_cmds.py          # xinfo, distance, entry
+│   ├── kd_cmds.py           # kdconnect / kdregs / kdmem / kdbp / kddisasm / kdlm / kdchecksec
+│   ├── kd_ps_cmds.py        # kdps / kdthreads / kdtoken (steal + shellcode)
+│   ├── kd_nav_cmds.py       # kdbt (heuristic backtrace) / kdxinfo
+│   ├── kd_search_cmds.py    # kdsearch -s/-x/-p [--module M]
+│   ├── kd_pte_cmds.py       # kdpte page-table walker
+│   └── kd_dt_cmds.py        # kddt / dt (WinDbg-style struct view)
 ├── core/
 │   ├── debugger.py          # Debug API engine
 │   ├── breakpoints.py       # INT3 breakpoint manager
 │   ├── memory.py            # Read/Write/Query memory
 │   ├── registers.py         # Thread context handling
 │   ├── symbols.py           # DbgHelp symbol resolution
-│   └── disasm.py            # Capstone wrapper
+│   ├── disasm.py            # Capstone wrapper
+│   └── kd/                  # Kernel debugging backend
+│       ├── transport.py         # Abstract transport (recv/send/connect)
+│       ├── gdb_transport.py     # QEMU GDB stub (RSP) transport + qRcmd monitor bridge
+│       ├── protocol.py          # KD packet helpers (placeholder for KDNET/pipe)
+│       ├── kd_session.py        # High-level session: regs, mem, bp, step, continue
+│       ├── kd_structs.py        # KD protocol structures (placeholder)
+│       ├── win_structs.py       # EPROCESS / KTHREAD / ETHREAD / KPCR offsets (mutated at runtime)
+│       ├── offset_extractor.py  # Disasm Ps* exports → recover struct offsets dynamically
+│       ├── ps_walker.py         # Walk ActiveProcessLinks + ThreadListHead
+│       ├── stack_walker.py      # Heuristic backtrace (call-validated frame scan)
+│       └── kernel_regions.py    # Classify kernel addresses (module/pool/KUSER/...)
 ├── display/
 │   ├── common.py            # Console, banners, colors
 │   ├── formatters.py        # Display facade

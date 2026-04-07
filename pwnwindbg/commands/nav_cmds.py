@@ -62,6 +62,13 @@ def _resolve_addr(debugger, token):
     from ..utils.addr_expr import eval_expr
     result = eval_expr(debugger, token)
     if result is None:
+        # In KD mode, try parsing as hex directly
+        from .kd_cmds import _kd_session
+        if _kd_session and _kd_session.connected:
+            try:
+                return int(token, 0)
+            except ValueError:
+                pass
         error(f"Cannot resolve '{token}' to an address")
     return result
 
@@ -335,7 +342,11 @@ def cmd_hexdump(debugger, args):
     # Auto-advance on repeat
     addr = debugger.track_examine("hexdump", addr, length)
 
-    data = read_memory_safe(debugger.process_handle, addr, length)
+    from .kd_cmds import _kd_session
+    if _kd_session and _kd_session.connected:
+        data = _kd_session.read_virtual(addr, length)
+    else:
+        data = read_memory_safe(debugger.process_handle, addr, length)
     if not data:
         error(f"Cannot read {length} bytes at {addr:#x}")
         return None

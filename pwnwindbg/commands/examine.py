@@ -7,6 +7,21 @@ from ..display.formatters import (
 from ..core.disasm import disassemble_at
 
 
+def _kd_session():
+    """Return active KD session or None."""
+    from .kd_cmds import _kd_session as s
+    return s if s and s.connected else None
+
+
+def _read_mem(debugger, addr, size):
+    """Read memory from KD session if active, else local process."""
+    kd = _kd_session()
+    if kd:
+        data = kd.read_virtual(addr, size)
+        return data if data else None
+    return read_memory_safe(debugger.process_handle, addr, size)
+
+
 def _parse_x_args(args, debugger):
     """Parse x/ command arguments: <address> [count]
     Returns (address, count) or (None, None)."""
@@ -19,7 +34,13 @@ def _parse_x_args(args, debugger):
     addr_str = parts[0]
     count = int(parts[1]) if len(parts) > 1 else 16
 
+    # For KD mode, try parsing as hex directly if eval_expr fails
     addr = eval_expr(debugger, addr_str)
+    if addr is None and _kd_session():
+        try:
+            addr = int(addr_str, 0)
+        except ValueError:
+            pass
     if addr is None:
         error(f"Cannot resolve address: {addr_str}")
         return None, None
@@ -35,7 +56,7 @@ def cmd_x_bytes(debugger, args):
 
     addr = debugger.track_examine("x/bx", addr, count)
 
-    data = read_memory_safe(debugger.process_handle, addr, count)
+    data = _read_mem(debugger, addr, count)
     if data is None:
         error(f"Cannot read memory at {addr:#x}")
         return None
@@ -53,7 +74,7 @@ def cmd_x_dwords(debugger, args):
     byte_count = count * 4
     addr = debugger.track_examine("x/wx", addr, byte_count)
 
-    data = read_memory_safe(debugger.process_handle, addr, byte_count)
+    data = _read_mem(debugger, addr, byte_count)
     if data is None:
         error(f"Cannot read memory at {addr:#x}")
         return None
@@ -71,7 +92,7 @@ def cmd_x_qwords(debugger, args):
     byte_count = count * 8
     addr = debugger.track_examine("x/gx", addr, byte_count)
 
-    data = read_memory_safe(debugger.process_handle, addr, byte_count)
+    data = _read_mem(debugger, addr, byte_count)
     if data is None:
         error(f"Cannot read memory at {addr:#x}")
         return None
@@ -89,14 +110,29 @@ def cmd_x_string(debugger, args):
         return None
 
     addr = eval_expr(debugger, parts[0])
+    if addr is None and _kd_session():
+        try:
+            addr = int(parts[0], 0)
+        except ValueError:
+            pass
     if addr is None:
         error(f"Cannot resolve address: {parts[0]}")
         return None
 
-    s = read_string(debugger.process_handle, addr, max_len=1024)
-    if s is None:
-        error(f"Cannot read memory at {addr:#x}")
-        return None
+    kd = _kd_session()
+    if kd:
+        data = kd.read_virtual(addr, 1024)
+        if not data:
+            error(f"Cannot read memory at {addr:#x}")
+            return None
+        # Extract null-terminated string
+        end = data.find(b'\x00')
+        s = data[:end].decode("utf-8", errors="replace") if end >= 0 else data.decode("utf-8", errors="replace")
+    else:
+        s = read_string(debugger.process_handle, addr, max_len=1024)
+        if s is None:
+            error(f"Cannot read memory at {addr:#x}")
+            return None
 
     from rich.text import Text
     text = Text()
@@ -109,6 +145,11 @@ def cmd_x_string(debugger, args):
 
 def cmd_x_instructions(debugger, args):
     """x/i <addr> [count] — disassemble"""
+    kd = _kd_session()
+    if kd:
+        from .kd_cmds import cmd_kddisasm
+        return cmd_kddisasm(debugger, args)
+
     addr, count = _parse_x_args(args, debugger)
     if addr is None:
         return None

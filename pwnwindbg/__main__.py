@@ -84,6 +84,9 @@ def handle_stop(debugger, stop_info):
     elif reason == "quit":
         pass
 
+    elif reason == "kd_handled":
+        pass  # KD commands display context themselves
+
     elif reason == "timeout":
         warn("Timeout waiting for debug event")
 
@@ -113,12 +116,20 @@ _active_debugger = None
 
 
 def _sigint_handler(signum, frame):
-    """Handle Ctrl+C: interrupt the debuggee if running."""
+    """Handle Ctrl+C: interrupt the debuggee if running, or KD target."""
     if _active_debugger and _active_debugger.state == DebuggerState.RUNNING:
         _active_debugger.interrupt()
-    else:
-        # Not running — raise normally so the REPL input is cancelled
-        raise KeyboardInterrupt
+        return
+    # Check for active KD session
+    try:
+        from .commands.kd_cmds import _kd_session
+        if _kd_session and _kd_session.connected and not _kd_session.stopped:
+            _kd_session.do_break()
+            return
+    except Exception:
+        pass
+    # Not running — raise normally so the REPL input is cancelled
+    raise KeyboardInterrupt
 
 
 def main():
@@ -184,6 +195,11 @@ def main():
             console.print()
             if debugger.state == DebuggerState.RUNNING:
                 debugger.interrupt()
+            else:
+                # Check KD session
+                from .commands.kd_cmds import _kd_session
+                if _kd_session and _kd_session.connected and not _kd_session.stopped:
+                    _kd_session.do_break()
             continue
         except EOFError:
             console.print()

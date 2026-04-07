@@ -90,6 +90,10 @@ def cmd_attach(debugger, args):
 
 def cmd_continue(debugger, args):
     """Continue execution: c / continue"""
+    from .kd_cmds import _kd_session
+    if _kd_session and _kd_session.connected:
+        from .kd_cmds import cmd_kdcontinue
+        return cmd_kdcontinue(debugger, args)
     from ..core.debugger import DebuggerState
     if debugger.state != DebuggerState.STOPPED:
         error("Process is not stopped")
@@ -99,6 +103,10 @@ def cmd_continue(debugger, args):
 
 def cmd_step_into(debugger, args):
     """Step into: si"""
+    from .kd_cmds import _kd_session
+    if _kd_session and _kd_session.connected:
+        from .kd_cmds import cmd_kdstep
+        return cmd_kdstep(debugger, args)
     from ..core.debugger import DebuggerState
     if debugger.state != DebuggerState.STOPPED:
         error("Process is not stopped")
@@ -108,6 +116,10 @@ def cmd_step_into(debugger, args):
 
 def cmd_step_over(debugger, args):
     """Step over: ni"""
+    from .kd_cmds import _kd_session
+    if _kd_session and _kd_session.connected:
+        from .kd_cmds import cmd_kdstep
+        return cmd_kdstep(debugger, args)
     from ..core.debugger import DebuggerState
     if debugger.state != DebuggerState.STOPPED:
         error("Process is not stopped")
@@ -126,6 +138,10 @@ def cmd_finish(debugger, args):
 
 def cmd_bp(debugger, args):
     """Set breakpoint: bp <address>"""
+    from .kd_cmds import _kd_session
+    if _kd_session and _kd_session.connected:
+        from .kd_cmds import cmd_kdbp
+        return cmd_kdbp(debugger, args)
     args = args.strip()
     if not args:
         error("Usage: bp <address|symbol>")
