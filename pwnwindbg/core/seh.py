@@ -35,6 +35,22 @@ UNW_FLAG_UHANDLER = 0x02
 UNW_FLAG_CHAININFO = 0x04
 
 
+# Module-keyed caches for parsed .pdata. Re-parsing a PE on every backtrace
+# frame is multi-second on big modules like ntdll, so we keep the parsed
+# RUNTIME_FUNCTION list (and handler list) per (path, base) — base is part of
+# the key so an unloaded+reloaded module at a different address invalidates.
+_RFS_CACHE = {}        # (path, base) -> sorted list of {begin, end, unwind_rva}
+_HANDLERS_CACHE = {}   # (path, base) -> list of {begin, end, handler, flags}
+_UNWIND_CACHE = {}     # (path, base, unwind_rva) -> bytes (raw UNWIND_INFO)
+
+
+def invalidate_pdata_cache():
+    """Drop the cached .pdata parses (e.g. on detach / re-run)."""
+    _RFS_CACHE.clear()
+    _HANDLERS_CACHE.clear()
+    _UNWIND_CACHE.clear()
+
+
 # ---------------------------------------------------------------------------
 # x86 SEH chain
 # ---------------------------------------------------------------------------
@@ -126,11 +142,20 @@ def list_handlers_in_module(module_base, module_path, max_count=None):
     """Return list of {begin, end, handler, flags} for the module's .pdata.
 
     `begin`, `end`, `handler` are absolute (runtime) addresses. Returns []
-    on parse failure.
+    on parse failure. Cached per (path, base) — same reasoning as
+    `list_runtime_functions`.
     """
+    key = (module_path, module_base)
+    cached = _HANDLERS_CACHE.get(key)
+    if cached is not None:
+        if max_count is not None:
+            return cached[:max_count]
+        return cached
+
     pe = _parse_pe_pdata(module_path)
     if pe is None:
-        return []
+        _HANDLERS_CACHE[key] = []
+        return _HANDLERS_CACHE[key]
 
     handlers = []
     try:
@@ -152,22 +177,31 @@ def list_handlers_in_module(module_base, module_path, max_count=None):
                 "handler": module_base + handler_rva,
                 "flags": flags,
             })
-            if max_count and len(handlers) >= max_count:
-                break
     finally:
         pe.close()
 
+    _HANDLERS_CACHE[key] = handlers
+    if max_count is not None:
+        return handlers[:max_count]
     return handlers
 
 
 def list_runtime_functions(module_base, module_path):
-    """Return raw RUNTIME_FUNCTION list (no handler filter).
+    """Return raw RUNTIME_FUNCTION list (no handler filter), sorted by begin.
 
-    Each entry is {begin, end, unwind_rva}. Useful for `find_function_at`.
+    Each entry is {begin, end, unwind_rva}. Cached per (path, base) so we
+    only ever pay the pefile parse once per module per session — critical
+    for `display_context`, which calls this on every step via the backtrace.
     """
+    key = (module_path, module_base)
+    cached = _RFS_CACHE.get(key)
+    if cached is not None:
+        return cached
+
     pe = _parse_pe_pdata(module_path)
     if pe is None:
-        return []
+        _RFS_CACHE[key] = []
+        return _RFS_CACHE[key]
     out = []
     try:
         entries = getattr(pe, "DIRECTORY_ENTRY_EXCEPTION", None) or []
@@ -179,7 +213,26 @@ def list_runtime_functions(module_base, module_path):
             })
     finally:
         pe.close()
+    out.sort(key=lambda r: r["begin"])
+    _RFS_CACHE[key] = out
     return out
+
+
+def _find_runtime_function(rfs, rip):
+    """Binary-search the (sorted) RUNTIME_FUNCTION list for the entry
+    covering `rip`. Returns the entry dict or None.
+    """
+    lo, hi = 0, len(rfs)
+    while lo < hi:
+        mid = (lo + hi) >> 1
+        rf = rfs[mid]
+        if rip < rf["begin"]:
+            hi = mid
+        elif rip >= rf["end"]:
+            lo = mid + 1
+        else:
+            return rf
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -327,12 +380,8 @@ def unwind_one_frame_x64(read_mem_fn, modules, rip, rsp, mid_prolog=False):
     if not rfs:
         return None, None
 
-    # Find covering RUNTIME_FUNCTION
-    rf = None
-    for cand in rfs:
-        if cand["begin"] <= rip < cand["end"]:
-            rf = cand
-            break
+    # Find covering RUNTIME_FUNCTION via binary search (rfs is sorted)
+    rf = _find_runtime_function(rfs, rip)
     if rf is None:
         # Leaf function: no .pdata entry. RA is at [rsp].
         ra = read_mem_fn(rsp, 8)
@@ -407,9 +456,8 @@ def find_handler_for_address(modules, rip):
     if not handlers:
         return None
 
-    # 2. Linear scan — handler ranges are sorted by begin in .pdata so
-    #    we could binary search, but typical .pdata has < 5000 entries and
-    #    this only runs on user request.
+    # Linear scan — typical .pdata has < 5000 entries with EHANDLER set
+    # and this only runs on user request, so a binary search isn't worth it.
     for h in handlers:
         if h["begin"] <= rip < h["end"]:
             return {"module": target_mod, **h}

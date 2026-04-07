@@ -249,6 +249,12 @@ class Debugger:
 
     def _cleanup(self):
         """Clean up handles and state."""
+        # Drop per-module caches that were populated for this target
+        try:
+            from .seh import invalidate_pdata_cache
+            invalidate_pdata_cache()
+        except Exception:
+            pass
         self.symbols.cleanup()
         for tid, th in self.threads.items():
             if th and th != self.main_thread_handle:
