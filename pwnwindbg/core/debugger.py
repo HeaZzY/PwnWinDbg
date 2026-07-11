@@ -393,6 +393,53 @@ class Debugger:
         return None
 
     # -----------------------------------------------------------------
+    # Function auto-discovery (stripped-image analysis)
+    # -----------------------------------------------------------------
+
+    def analyze(self, force=False):
+        """Discover functions in the MAIN executable and register them.
+
+        Lazy + guarded: needs ``self.exe_path`` and a known image base. Skips
+        re-running for a base already analyzed unless ``force=True``. Imports
+        ``core.analysis`` lazily so nothing is pulled in until first use.
+
+        Returns the number of functions registered for the exe (0 on failure).
+        Never raises — analysis errors degrade to "no discovered functions".
+        """
+        try:
+            if not self.exe_path:
+                return 0
+
+            # Resolve the exe module's live base: prefer the tracked module
+            # whose path matches exe_path, else fall back to image_base.
+            base = None
+            try:
+                for mod in self.symbols.modules:
+                    if mod.path and os.path.normcase(mod.path) == \
+                            os.path.normcase(self.exe_path):
+                        base = mod.base_address
+                        break
+            except Exception:
+                base = None
+            if base is None:
+                base = self.image_base
+            if not base:
+                return 0
+
+            if not force and base in self.symbols.analyzed_bases:
+                return len(self.symbols.discovered)
+
+            from . import analysis
+            funcs = analysis.discover_functions(
+                self.exe_path, base, is_64=not self.is_wow64
+            )
+            self.symbols.set_discovered(funcs)
+            self.symbols.analyzed_bases.add(base)
+            return len(funcs)
+        except Exception:
+            return 0
+
+    # -----------------------------------------------------------------
     # Debug loop
     # -----------------------------------------------------------------
 

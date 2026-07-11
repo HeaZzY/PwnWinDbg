@@ -8,6 +8,7 @@ from .execution import (
 from .examine import parse_x_command
 from .info_cmds import (
     cmd_info, cmd_checksec, cmd_iat, cmd_vmmap, cmd_modules, cmd_functions,
+    cmd_analyze_funcs,
 )
 from .memory_cmds import cmd_stack, cmd_telescope, cmd_p2p
 from .display_cmds import cmd_regs, cmd_disasm, display_context
@@ -175,6 +176,8 @@ COMMANDS = {
     "modules":      (cmd_modules,   "List loaded modules"),
     "functions":    (cmd_functions, "List functions: functions [filter]"),
     "funcs":        (cmd_functions, "Alias for functions"),
+    "analyze-functions": (cmd_analyze_funcs, "Discover functions in the main image (stripped-binary analysis)"),
+    "afl":          (cmd_analyze_funcs, "Alias for analyze-functions (analyze function list)"),
 
     # PEB / TEB
     "peb":          (cmd_peb,       "Show PEB: peb [-v|modules|env|params]"),

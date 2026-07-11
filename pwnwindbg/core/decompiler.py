@@ -233,6 +233,50 @@ def _pdata_bounds(debugger, addr):
     return None
 
 
+def _discovered_bounds(debugger, addr):
+    """Bounds from the debugger's auto-discovered function table, or None.
+
+    Ensures analysis has run (guarded), locates the discovered function head
+    at/below ``addr``, and returns ``(start, end)`` where ``end`` is the next
+    discovered start above it (or the main-image end). Only trusts a start when
+    both it and ``addr`` sit inside the main executable image.
+    """
+    try:
+        debugger.analyze()
+    except Exception:
+        pass
+    syms = getattr(debugger, "symbols", None)
+    if syms is None:
+        return None
+    try:
+        dc = syms.discovered_containing(addr)
+    except Exception:
+        dc = None
+    if not dc:
+        return None
+    start, _name = dc
+
+    rng = _main_image_range(debugger)
+    if not rng:
+        return None
+    lo, hi = rng
+    if not (lo <= start <= addr < hi):
+        return None
+
+    end = hi
+    try:
+        import bisect
+        starts = getattr(syms, "_discovered_sorted", None) or []
+        pos = bisect.bisect_right(starts, start)
+        if pos < len(starts):
+            nxt = starts[pos]
+            if lo <= nxt <= hi:
+                end = nxt
+    except Exception:
+        pass
+    return int(start), int(end)
+
+
 def _heuristic_bounds(debugger, addr, max_insns):
     """Scan backward to the nearest prologue and forward to the terminating ret."""
     # ---- backward: find the nearest prologue at/before addr ----
@@ -285,10 +329,23 @@ def _heuristic_bounds(debugger, addr, max_insns):
 def get_function_bounds(debugger, addr, max_insns=_DEFAULT_MAX_INSNS):
     """Return (start, end) for the function containing `addr`.
 
-    Prefers x64 .pdata bounds; otherwise a prologue/ret heuristic. Always
-    returns a sane window with start <= addr < end, even when heuristics are
-    weak (final fallback [addr-0x40 .. addr+0x200]).
+    Prefers auto-discovered function starts (works on stripped images), then
+    x64 .pdata bounds, then a prologue/ret heuristic. Always returns a sane
+    window with start <= addr < end, even when heuristics are weak (final
+    fallback [addr-0x40 .. addr+0x200]).
     """
+    # Discovered functions take priority: on a stripped image they are the only
+    # reliable source of head/extent, and they also beat .pdata when present.
+    try:
+        b = _discovered_bounds(debugger, addr)
+        if b is not None:
+            start, end = b
+            if end - start > _MAX_SPAN_BYTES:
+                end = start + _MAX_SPAN_BYTES
+            if start <= addr < end:
+                return start, end
+    except Exception:
+        pass
     try:
         b = _pdata_bounds(debugger, addr)
         if b is not None:

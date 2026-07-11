@@ -3,7 +3,7 @@
 import os
 from ..display.formatters import (
     display_process_info, display_checksec, display_iat,
-    display_vmmap, error, info, banner, console,
+    display_vmmap, error, info, success, banner, console,
 )
 
 
@@ -94,6 +94,14 @@ def cmd_functions(debugger, args):
         error("No executable path available")
         return None
 
+    # Ensure stripped-image function discovery has run (cheap after first
+    # time; guarded internally). This is what lets `info functions` list the
+    # main exe's sub_* functions when it has no symbols/exports.
+    try:
+        debugger.analyze()
+    except Exception:
+        pass
+
     import pefile
     from rich.text import Text
 
@@ -173,6 +181,24 @@ def cmd_functions(debugger, args):
     except Exception:
         pass
 
+    # 3. Auto-discovered functions of the main exe (stripped-image analysis).
+    #    These are the sub_* / _start heads recovered by debugger.analyze().
+    discovered = getattr(debugger.symbols, "discovered", None)
+    if discovered:
+        exe_name = os.path.basename(debugger.exe_path)
+        for addr in getattr(debugger.symbols, "_discovered_sorted", sorted(discovered)):
+            name = discovered.get(addr)
+            if not name:
+                continue
+            if filter_str and filter_str not in name.lower():
+                continue
+            text = Text()
+            text.append(f"  {addr:#010x}", style="bright_cyan")
+            text.append(f"  {exe_name}!", style="bright_black")
+            text.append(name, style="bright_green")
+            console.print(text)
+            count += 1
+
     if count == 0:
         console.print("  No functions found.", style="bright_black")
         if filter_str:
@@ -180,6 +206,21 @@ def cmd_functions(debugger, args):
     else:
         console.print(f"\n  [bright_black]{count} functions listed[/]")
 
+    return None
+
+
+def cmd_analyze_funcs(debugger, args):
+    """Discover functions in the main image: analyze-functions / afl
+
+    Distinct from the `analyze` command (WinDbg-style crash triage). Forces a
+    fresh stripped-image analysis pass and reports how many function starts
+    were recovered.
+    """
+    if not debugger.process_handle:
+        error("No process attached")
+        return None
+    n = debugger.analyze(force=True)
+    success(f"discovered {n} functions")
     return None
 
 

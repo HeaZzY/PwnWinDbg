@@ -88,6 +88,12 @@ class SymbolManager:
         # base_address -> int  (real symbol count after a force-load enum,
         # since IMAGEHLP_MODULE64.NumSyms is unreliable post-load)
         self._sym_counts = {}
+        # Auto-discovered functions from stripped-image analysis
+        # (core.analysis.discover_functions). addr:int -> name:str, rebased to
+        # the live image_base. Populated via set_discovered().
+        self.discovered = {}
+        self._discovered_sorted = []  # sorted list of discovered start addrs
+        self.analyzed_bases = set()   # image bases already analyzed
 
     def init_dbghelp(self, process_handle):
         """Initialize DbgHelp with the Microsoft symbol server wired up.
@@ -561,6 +567,72 @@ class SymbolManager:
             if entry[0] == "real":
                 self._export_by_addr[entry[3]] = (orig_mod, orig_func)
 
+    # ---- discovered (auto-analysis) function table ----
+
+    def set_discovered(self, funcs):
+        """Merge a batch of discovered ``{addr:int -> name:str}`` functions.
+
+        Rebuilds the sorted-start index so ``discovered_containing`` and
+        reverse name lookups stay in sync. Idempotent: re-registering the same
+        addresses just overwrites their names. Never raises.
+        """
+        if not funcs:
+            return
+        try:
+            for addr, name in funcs.items():
+                self.discovered[int(addr)] = name
+            self._discovered_sorted = sorted(self.discovered)
+        except Exception:
+            pass
+
+    def discovered_containing(self, address):
+        """Return ``(start, name)`` for the discovered function containing
+        ``address`` (greatest start <= address), or ``None``.
+
+        The caller decides whether ``address`` actually falls inside that
+        function's range — this only locates the nearest start at/below it.
+        """
+        import bisect
+
+        starts = self._discovered_sorted
+        if not starts:
+            return None
+        pos = bisect.bisect_right(starts, address) - 1
+        if pos < 0:
+            return None
+        start = starts[pos]
+        name = self.discovered.get(start)
+        if name is None:
+            return None
+        return (start, name)
+
+    def _resolve_discovered_name(self, name):
+        """Resolve a discovered function name to an address, or ``None``.
+
+        Accepts bare (``sub_401000`` / ``_start``) and module-qualified
+        (``ch72.exe!sub_401000``) spellings, case-insensitively, and also
+        parses ``sub_<hex>`` directly when that hex is a known start.
+        """
+        if not self.discovered:
+            return None
+        key = (name or "").strip()
+        if "!" in key:
+            key = key.split("!", 1)[1]
+        key_l = key.lower()
+        if not key_l:
+            return None
+        for addr, nm in self.discovered.items():
+            if nm.lower() == key_l:
+                return addr
+        if key_l.startswith("sub_"):
+            try:
+                a = int(key_l[4:], 16)
+            except ValueError:
+                return None
+            if a in self.discovered:
+                return a
+        return None
+
     def resolve_address(self, address):
         """Resolve an address to 'module!symbol' or 'module+offset'.
         Returns a string or None."""
@@ -575,6 +647,26 @@ class SymbolManager:
         if hit:
             mod_name, func_name = hit
             return f"{mod_name}!{func_name}"
+
+        # Try auto-discovered functions (stripped-image analysis). Runs before
+        # the bare module+offset fallback so a stripped exe shows
+        # `ch72.exe!sub_401000` instead of `ch72.exe+0x1000`.
+        if self.discovered:
+            mod = self.get_module_at(address)
+            mod_name = mod.name if mod else None
+            exact = self.discovered.get(address)
+            if exact is not None:
+                return f"{mod_name}!{exact}" if mod_name else exact
+            dc = self.discovered_containing(address)
+            if dc is not None:
+                start, name = dc
+                # Only label with the discovered function when the containing
+                # start lives in the SAME module as the queried address.
+                if mod is not None and mod.contains(start):
+                    offset = address - start
+                    if offset == 0:
+                        return f"{mod_name}!{name}"
+                    return f"{mod_name}!{name}+{offset:#x}"
 
         # Fall back to module+offset
         mod = self.get_module_at(address)
@@ -636,6 +728,13 @@ class SymbolManager:
             return int(name, 0)
         except ValueError:
             pass
+
+        # Auto-discovered function names (sub_XXXX / _start / mod!sub_XXXX).
+        # These are specific to stripped-image analysis and never collide with
+        # real exports, so resolve them before the export/DbgHelp lookups.
+        disc = self._resolve_discovered_name(name)
+        if disc is not None:
+            return disc
 
         # Try the PE export cache first. It already chased forwarder chains
         # at load time, so for names like `HeapAlloc` it returns the real
