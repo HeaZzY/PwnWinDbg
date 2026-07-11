@@ -67,6 +67,7 @@ from .kd_dt_cmds import cmd_kddt
 from .kd_callback_cmds import cmd_kdcallbacks
 from .kd_ssdt_cmds import cmd_kdssdt
 from .kd_vad_cmds import cmd_kdvad
+from .ai_cmds import cmd_ai
 from ..display.formatters import error, info, console
 
 
@@ -276,6 +277,9 @@ COMMANDS = {
     "kdcallbacks":  (cmd_kdcallbacks,   "Enumerate Psp{Process,Thread,Image}Notify callback arrays"),
     "kdssdt":       (cmd_kdssdt,        "Dump KeServiceDescriptorTable: kdssdt [count] [-h]"),
     "kdvad":        (cmd_kdvad,         "Walk a process VAD tree: kdvad <pid|name> [-x|-w]"),
+
+    # AI agent
+    "ai":           (cmd_ai,        'AI agent: ai "<task>" | ai config|use|model|key|status'),
 }
 
 
@@ -440,6 +444,12 @@ _USERLAND_HELP = {
         ("p2p <addr>",            "Deep pointer chain"),
         ("xinfo <addr>",          "Detailed address info (region/module/perms)"),
         ("distance <a> <b>",      "Offset between two addresses"),
+    ],
+    "AI agent": [
+        ('ai "<task>"',           "Autonomous AI drives the debugger to solve a task"),
+        ("ai use <provider>",     "Pick backend: claude_code | openai | anthropic"),
+        ("ai config / status",    "Show/set config (key, model, path)"),
+        ("run -i <exe>",          "Spawn with an I/O tube so the AI can send/recv"),
     ],
     "Heap analysis": [
         ("heap",                  "List all process heaps (CRT, NT, LFH, Segment)"),

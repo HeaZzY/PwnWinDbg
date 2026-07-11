@@ -34,6 +34,10 @@ from .watchpoints import WatchpointManager
 from .symbols import SymbolManager
 from .disasm import create_disassembler, disassemble_at
 
+# Not exported by utils.constants — defined here for the pipe-backed
+# (interactive) spawn path so the child runs without popping a console window.
+CREATE_NO_WINDOW = 0x08000000
+
 
 class DebuggerState:
     """Tracks current debugger state."""
@@ -54,6 +58,9 @@ class Debugger:
         self.main_thread_handle = None
         self.main_thread_id = None
         self.exe_path = None
+        # Interactive I/O tube (pwntools-style) to the debuggee's
+        # stdin/stdout, populated when spawning with pipe_io=True.
+        self.tube = None
         # Last spawn arguments — saved so `run` (no args) and `rerun`
         # can re-launch the same target without retyping.
         self.exe_args = ""
@@ -125,10 +132,24 @@ class Debugger:
         # key -> (original_requested_addr, next_addr)
         self._examine_next = {}
 
-    def spawn(self, exe_path, args="", stdin_file=None):
+    def spawn(self, exe_path, args="", stdin_file=None, pipe_io=False):
         """Spawn a new process under the debugger.
         stdin_file: path to a file to redirect as the process stdin.
+        pipe_io:    when True, wire the child's stdin/stdout/stderr to anonymous
+                    pipes and expose them as a pwntools-style ``self.tube`` so
+                    the AI agent (or scripts) can send()/recv() to the debuggee.
+                    In this mode the child has no console window and ``stdin_file``
+                    is ignored (the tube owns stdin).
         """
+        # Drop any stale tube from a previous run (e.g. the prior process
+        # exited on its own without going through terminate()/_cleanup()).
+        if self.tube is not None:
+            try:
+                self.tube.close()
+            except Exception:
+                pass
+            self.tube = None
+
         si = STARTUPINFOW()
         si.cb = sizeof(si)
         pi = PROCESS_INFORMATION()
@@ -142,8 +163,21 @@ class Debugger:
 
         inherit_handles = False
         stdin_handle = None
+        child_handles_to_close = None
 
-        if stdin_file:
+        if pipe_io:
+            # Interactive tube: build a STARTUPINFOW wired to fresh anonymous
+            # pipes; the parent-side ends live on the returned ProcTube. No
+            # console window for the child so its I/O only flows over the pipe.
+            from .proc_io import make_pipe_startupinfo
+            si, tube, child_handles_to_close = make_pipe_startupinfo()
+            si.cb = sizeof(si)
+            self.tube = tube
+            flags = (
+                DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW
+            )
+            inherit_handles = True
+        elif stdin_file:
             # Open file as inheritable handle for child stdin
             import msvcrt
             GENERIC_READ = 0x80000000
@@ -196,7 +230,25 @@ class Debugger:
         if stdin_handle and stdin_handle != -1:
             kernel32.CloseHandle(stdin_handle)
 
+        # Close the child-side pipe ends now that the child inherited its own
+        # copies; if the parent kept the stdout-write end open, the tube's
+        # reader thread would never observe EOF.
+        if child_handles_to_close:
+            for h in child_handles_to_close:
+                try:
+                    kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+
         if not ok:
+            if pipe_io and self.tube is not None:
+                # Spawn failed — tear down the half-built tube so we don't leak
+                # the parent-side pipe handles / reader thread.
+                try:
+                    self.tube.close()
+                except Exception:
+                    pass
+                self.tube = None
             err = ctypes.GetLastError()
             raise RuntimeError(f"CreateProcessW failed (err={err})")
 
@@ -283,6 +335,14 @@ class Debugger:
             invalidate_pdata_cache()
         except Exception:
             pass
+        # Tear down the interactive I/O tube (closes parent-side pipe handles
+        # and stops the reader thread) before we drop the process handles.
+        if self.tube is not None:
+            try:
+                self.tube.close()
+            except Exception:
+                pass
+            self.tube = None
         self.symbols.cleanup()
         for tid, th in self.threads.items():
             if th and th != self.main_thread_handle:
