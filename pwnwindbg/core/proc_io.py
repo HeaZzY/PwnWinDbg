@@ -175,6 +175,22 @@ class ProcTube:
             raise RuntimeError(f"WriteFile to debuggee stdin failed (err={err})")
         return written.value
 
+    def shutdown_stdin(self):
+        """Close the debuggee's stdin (send EOF) without touching stdout.
+
+        Many console reads (fgets/scanf/gets/fread) only return once they see a
+        newline OR end-of-file. After sending a payload, call this so a blocked
+        read returns and the function proceeds to its (now smashed) epilogue.
+        Idempotent.
+        """
+        h = self._stdin_write
+        self._stdin_write = None
+        if h:
+            try:
+                kernel32.CloseHandle(h)
+            except Exception:
+                pass
+
     # -- reading ----------------------------------------------------------
 
     def read_available(self, max=65536):

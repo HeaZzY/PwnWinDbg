@@ -188,8 +188,16 @@ def run_agent(debugger, task):
     tools = DebugTools(debugger)
     server = None
     prev_record = getattr(console, "record", False)
+    prev_run_timeout = getattr(debugger, "run_timeout", None)
     prev_sigint = None
     installed_sigint = False
+
+    # Bound every agent-driven `continue`/step so a debuggee blocked on stdin
+    # returns control (as a "timeout" stop) instead of hanging the loop.
+    try:
+        debugger.run_timeout = float(cfg.get("continue_timeout", 15) or 15)
+    except Exception:
+        debugger.run_timeout = 15
 
     try:
         server = RpcServer(tools)
@@ -353,6 +361,10 @@ def run_agent(debugger, task):
                 pass
         try:
             console.record = prev_record
+        except Exception:
+            pass
+        try:
+            debugger.run_timeout = prev_run_timeout
         except Exception:
             pass
 

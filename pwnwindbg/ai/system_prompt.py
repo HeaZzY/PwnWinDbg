@@ -91,6 +91,7 @@ def build_system_prompt(state_summary, code_exec, cmd_cheatsheet):
             "      send(data) / sendline(data)   write to the DEBUGGEE stdin\n"
             "      recv(n, timeout) / recvuntil(delim, timeout) / recvline(timeout)\n"
             "                            read from the DEBUGGEE stdout\n"
+            "      shutdown_stdin()      close the debuggee's stdin (send EOF)\n"
             "      eval_addr(\"rsp+0x10\") evaluate an address expression -> int\n"
             "      state()               dict: state, pid, arch, rip, has_tube\n"
             "      log(msg)              print a note on the debugger console\n"
@@ -157,6 +158,43 @@ Rules:
     (dbg / python) immediately after the opening ``` then a newline.
   - Some commands are blocked for safety (quit/exit/ai); do not rely on them.
   - Read the returned output carefully before your next action.
+
+DRIVING A TARGET THAT READS STDIN (pwn workflow):
+  0. Be DECISIVE and efficient. Once dbg("run -i <exe>") gives a live tube, drive
+     the exploit DYNAMICALLY (send/shutdown_stdin/continue + cyclic) — do not
+     retreat into laborious static disassembly unless the dynamic path is truly
+     blocked. A simple ret2win/ret2shellcode should take only a few steps.
+  1. Spawn WITH a tube: dbg("run -i <exe>"). send()/recv() only work with a tube.
+  2. `continue` (dbg("c")) BLOCKS until the process stops or crashes. If the
+     program is waiting for input, PROVIDE IT FIRST: send(data)/sendline(data),
+     then shutdown_stdin() to signal EOF (many reads only return on newline OR
+     end-of-file). NEVER continue a stdin-blocked program without feeding it.
+  3. `continue` is time-bounded here: a stop whose reason is "timeout" means the
+     process is STILL RUNNING (it did NOT crash — usually waiting for input).
+     Feed it and continue again; do not conclude it is unexploitable.
+  4. Classic stack-overflow recipe on a no-ASLR/no-DEP binary — do it in ONE
+     ```python block so it doesn't stall between steps:
+        send(cyclic(600))            # start SMALL (200-800): a huge payload
+        shutdown_stdin()             #   overruns the whole stack and faults in
+        print(dbg("c"))              #   the copy before it can return
+        r = regs(); print(r)         # inspect EIP and the fault address
+        print("off_eip", cyclic_find(r.get("Eip") or r.get("Rip")))
+     Then: payload = b"A"*offset + p32(win_addr); send(payload); shutdown_stdin();
+     print(dbg("c")); and VERIFY success empirically (a cmd.exe/child spawned, a
+     flag printed, or recv() output) — do not assume.
+  5. Find the target: inspect `iat`, strings, and xrefs to interesting strings
+     (system / WinExec / "cmd.exe"). A hidden function that spawns a shell is your
+     ret2win target. With DEP off you can alternatively jump to shellcode placed
+     in your buffer via a fixed `jmp esp` gadget (try `rop --search "jmp esp"`).
+  6. Deliver the final exploit as a GENUINE, idiomatic pwntools script via
+     write_file("exploit.py", ...). It MUST start with `from pwn import *` and
+     use a real pwntools tube: `io = process("ch72.exe")` for a local binary (or
+     `io = remote(HOST, PORT)` for a networked service), then io.send()/
+     sendline()/recvuntil()/recvline()/interactive(), with p32()/p64()/cyclic()/
+     cyclic_find() for the payload and offsets. Do NOT hand-roll subprocess
+     piping or raw file redirection — that is not a pwntools exploit. pwntools
+     process() works in this environment. Then VERIFY it end-to-end by running
+     sh("python exploit.py") and confirming a success marker in the output.
 
 Current debugger state:
 {state_summary}

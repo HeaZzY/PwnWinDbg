@@ -71,6 +71,12 @@ def cmd_run(debugger, args):
         error(f"File not found: {exe}")
         return None
 
+    # Resolve to an absolute path: CreateProcessW does not search the current
+    # directory for a bare relative name when NoDefaultCurrentDirectoryInExePath
+    # is in effect, so `run -i ch72.exe` would fail with err=2 even though the
+    # file exists in the cwd. abspath makes every form spawn reliably.
+    exe = os.path.abspath(exe)
+
     return _spawn_and_run(debugger, exe, extra_args, stdin_file, pipe_io=pipe_io)
 
 

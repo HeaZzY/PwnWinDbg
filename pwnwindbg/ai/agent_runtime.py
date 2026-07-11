@@ -80,6 +80,10 @@ def build_namespace(rpc_client):
         """Receive one line from the debuggee's stdout."""
         return rpc_client.call("recvline", float(timeout))
 
+    def shutdown_stdin():
+        """Close the debuggee's stdin (send EOF) so a blocked read returns."""
+        return rpc_client.call("shutdown_stdin")
+
     def eval_addr(expr):
         """Evaluate an address expression in the parent to an int."""
         return rpc_client.call("eval_addr", str(expr))
@@ -242,6 +246,9 @@ def build_namespace(rpc_client):
         "recv": recv,
         "recvuntil": recvuntil,
         "recvline": recvline,
+        "shutdown_stdin": shutdown_stdin,
+        "shutdown": shutdown_stdin,
+        "eof": shutdown_stdin,
         "eval_addr": eval_addr,
         "state": state,
         "log": log,

@@ -61,11 +61,22 @@ class Debugger:
         # Interactive I/O tube (pwntools-style) to the debuggee's
         # stdin/stdout, populated when spawning with pipe_io=True.
         self.tube = None
+        # Optional wall-clock cap (seconds) for a single run_until_stop. None =
+        # wait forever (interactive default). The AI agent sets this so a
+        # `continue` on a debuggee that is blocked waiting for input returns
+        # control (as a "timeout" stop) instead of hanging the agent loop.
+        self.run_timeout = None
         # Last spawn arguments — saved so `run` (no args) and `rerun`
         # can re-launch the same target without retyping.
         self.exe_args = ""
         self.exe_stdin_file = None
         self.image_base = None
+        # Auto-decompile context pane toggle (tri-state):
+        #   None  -> not yet initialized (lazy default from ai config on first use)
+        #   True  -> show the pseudo-C pane in display_context
+        #   False -> hidden
+        # NOTE: do not import ai/config here — the default is resolved lazily.
+        self.show_decompile = None
 
         # Architecture
         self.is_wow64 = False  # True if debugging a 32-bit process on 64-bit OS
@@ -411,8 +422,18 @@ class Debugger:
 
     def run_until_stop(self):
         """Run the debug loop until we hit a breakpoint or other stop condition.
-        Uses short timeouts so Ctrl+C / interrupt() can take effect."""
+        Uses short timeouts so Ctrl+C / interrupt() can take effect.
+
+        If ``self.run_timeout`` is set (seconds), a run that produces no stop
+        within that window is force-interrupted so control returns as a
+        ``timeout`` stop instead of blocking forever — used by the AI agent so a
+        `continue` on a debuggee waiting for stdin doesn't hang the loop.
+        """
+        import time
         self._interrupt_requested = False
+        timeout_s = getattr(self, "run_timeout", None)
+        deadline = (time.monotonic() + timeout_s) if timeout_s else None
+        forced = False
         while True:
             # Poll with 100ms timeout so we remain responsive
             event = self.wait_for_event(timeout=100)
@@ -420,10 +441,22 @@ class Debugger:
                 # Timeout — check if we should keep waiting
                 if self.state == DebuggerState.TERMINATED:
                     return {"reason": "exit", "exit_code": -1}
+                if deadline is not None and not forced and \
+                        time.monotonic() >= deadline and \
+                        self.state == DebuggerState.RUNNING:
+                    # Bounded run (agent mode): force a break so control returns
+                    # instead of hanging (e.g. debuggee blocked reading stdin).
+                    forced = True
+                    self.interrupt()
                 continue
 
             result = self._handle_event(event)
             if result:
+                # Relabel the forced break so the caller/agent knows the process
+                # was still running (usually waiting for input), not a real BP.
+                if forced and result.get("reason") in ("interrupt", "single_step"):
+                    result["reason"] = "timeout"
+                    result["timed_out"] = True
                 self.last_stop_info = result
                 return result
 

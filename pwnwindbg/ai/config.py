@@ -20,10 +20,14 @@ DEFAULT_CONFIG = {
     "max_steps": 30,
     "max_obs_chars": 6000,
     "python_timeout": 120,
+    "continue_timeout": 15,
     "temperature": 0.2,
     "code_exec": True,
     "spawn_with_pipes": True,
     "blocked_commands": ["quit", "q", "exit", "ai"],
+    # Native AI decompiler (see core/decompiler.py, commands/decompile_cmds.py).
+    "decompile_auto": True,       # show the pseudo-C pane in the live context
+    "decompile_max_insns": 400,   # cap on instructions decompiled per function
     "openai": {
         "base_url": "https://api.moonshot.ai/v1",
         "model": "kimi-k2-0711-preview",

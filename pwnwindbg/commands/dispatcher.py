@@ -11,6 +11,7 @@ from .info_cmds import (
 )
 from .memory_cmds import cmd_stack, cmd_telescope, cmd_p2p
 from .display_cmds import cmd_regs, cmd_disasm, display_context
+from .decompile_cmds import cmd_decompile
 from .cyclic_cmds import cmd_cyclic
 from .search_cmds import cmd_search
 from .patch_cmds import cmd_patch, cmd_set, cmd_write, cmd_dump
@@ -132,6 +133,9 @@ COMMANDS = {
     "ctx":          (lambda d, a: (display_context(d), None)[1], "Alias for context"),
     "hexdump":      (cmd_hexdump,   "Hex + ASCII dump: hexdump <addr> [size]"),
     "hd":           (cmd_hexdump,   "Alias for hexdump"),
+    "decompile":    (cmd_decompile, "AI pseudo-C of the function (native, cached; `decompile on/off`)"),
+    "dc":           (cmd_decompile, "Alias for decompile"),
+    "pdc":          (cmd_decompile, "Alias for decompile"),
 
     # Memory
     "stack":        (cmd_stack,     "Show stack: stack [count]"),
@@ -418,6 +422,7 @@ _USERLAND_HELP = {
         ("context / ctx",         "Full pwndbg-style context (regs+disasm+stack+bt)"),
         ("regs",                  "Show registers (highlights changes)"),
         ("disasm / u [addr] [n]", "Disassemble N instructions"),
+        ("decompile / dc [addr]", "AI pseudo-C of the function (native, cached; `decompile on/off`)"),
         ("hexdump / hd <addr>",   "Hex + ASCII dump"),
         ("stack [count]",         "Telescope-style stack view"),
         ("tel [addr] [depth]",    "Recursive pointer dereference (telescope)"),

@@ -211,6 +211,15 @@ class DebugTools:
             pass
         return data
 
+    def shutdown_stdin(self):
+        """Close the debuggee's stdin (send EOF) so a blocked read returns."""
+        self._tube().shutdown_stdin()
+        try:
+            ai_view.tool_activity("info", "shutdown stdin (EOF sent to debuggee)")
+        except Exception:
+            pass
+        return None
+
     # -- misc ----------------------------------------------------------
 
     def eval_addr(self, expr):

@@ -372,4 +372,28 @@ def display_context(debugger):
             symbol_resolver=debugger.symbols.resolve_address,
         )
 
+    # 5. DECOMPILE (auto, native AI pseudo-C). Fully guarded so a decompiler
+    # problem — or a slow/failed LLM call — never breaks the context render.
+    try:
+        show = getattr(debugger, "show_decompile", None)
+        if show is None:  # lazy default from config on first use
+            try:
+                from ..ai import config as _c
+                show = bool(_c.load().get("decompile_auto", True))
+            except Exception:
+                show = True
+            debugger.show_decompile = show
+        if show and regs:
+            ip_key = "Eip" if debugger.is_wow64 else "Rip"
+            eip = regs.get(ip_key, 0)
+            if eip:
+                from ..core.decompiler import decompile_function
+                from ..display.decompile_view import display_decompile
+                res = decompile_function(debugger, eip)  # None for lib/disabled
+                if res:
+                    console.print()
+                    display_decompile(res, eip)
+    except Exception:
+        pass
+
     separator()

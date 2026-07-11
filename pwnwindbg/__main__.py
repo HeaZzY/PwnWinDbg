@@ -122,7 +122,15 @@ def handle_stop(debugger, stop_info):
         pass  # KD commands display context themselves
 
     elif reason == "timeout":
-        warn("Timeout waiting for debug event")
+        if stop_info.get("timed_out"):
+            warn("Continue timed out — the process is STILL RUNNING, almost "
+                 "always because it is blocked waiting for stdin. Send its input "
+                 "with send()/sendline() (and shutdown_stdin() to signal EOF for "
+                 "reads that consume until EOF), then continue again. If you "
+                 "already sent a crashing payload and it did not fault, the "
+                 "offset/target is probably wrong.")
+        else:
+            warn("Timeout waiting for debug event")
 
 
 def _show_ret_info(debugger):
