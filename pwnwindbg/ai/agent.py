@@ -245,6 +245,7 @@ def run_agent(debugger, task):
             "Begin. Inspect state as needed and act."
         )
 
+        no_block_streak = 0
         for step in range(1, max_steps + 1):
             ai_view.step_header(step, max_steps)
 
@@ -265,8 +266,27 @@ def run_agent(debugger, task):
 
             blocks = _parse_blocks(full_text)
             if not blocks:
-                ai_view.final_answer(full_text)
-                break
+                # No actionable block. This is EITHER a genuine final answer OR
+                # the model just narrated its intent ("I'll start by...") without
+                # acting. Don't stop on a short, non-conclusive first no-block
+                # turn — nudge it to act or truly finalize. Accept as final when
+                # it's a substantial conclusion, or on a second consecutive
+                # no-block turn (so we can't loop forever).
+                if no_block_streak >= 1 or len(full_text.strip()) > 400:
+                    ai_view.final_answer(full_text)
+                    break
+                no_block_streak += 1
+                info("ai: no action block — nudging the agent to act or finalize")
+                user_text = (
+                    "Your last message contained no ```dbg or ```python block, "
+                    "so NOTHING was executed and you received no new observation. "
+                    "Do not merely describe what you will do. If the task is "
+                    "FULLY solved, give your final answer now. Otherwise emit a "
+                    "```dbg or ```python block RIGHT NOW to take the next "
+                    "concrete step."
+                )
+                continue
+            no_block_streak = 0
 
             observations = []
             for kind, body in blocks:

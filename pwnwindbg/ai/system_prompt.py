@@ -127,6 +127,13 @@ each message you send, the blocks are executed in order and their combined
 output is returned to you as the next user message. Keep acting until the task
 is solved, then stop.
 
+ACT IMMEDIATELY. Every message you send — INCLUDING your very first one — must
+either contain a ```dbg / ```python action block, or be your final answer. Never
+send a message that only announces what you are about to do (e.g. "I'll start by
+inspecting the binary"). If you intend to inspect or do something, put the block
+that actually does it in THIS SAME message. A message with no block and no real
+conclusion just wastes a turn and stalls you.
+
   * A fenced ```dbg block runs debugger commands, ONE command per line. Example:
 
     ```dbg
@@ -137,9 +144,11 @@ is solved, then stop.
 
 {python_tool}
 
-  * When you are DONE, reply with your final answer as plain prose and include
-    NO ```dbg or ```python block. The absence of an action block signals
-    completion.
+  * When (and ONLY when) the task is fully solved, reply with your final answer
+    as plain prose and include NO ```dbg or ```python block. Omitting the block
+    is what signals completion — so never omit it while you still have any step
+    left to do. A short message with no block is treated as "you stalled" and
+    you will be prompted to actually act.
 
 Rules:
   - Blocks execute in document order; a message may mix a ```dbg and a

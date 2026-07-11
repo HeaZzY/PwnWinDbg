@@ -91,6 +91,12 @@ class ClaudeCodeSession(AgentSession):
             "--output-format", "stream-json",
             "--verbose",
             "--max-turns", "1",
+            # Disable ALL of Claude Code's built-in tools (Bash/Read/Write/...).
+            # We use the CLI purely as a text reasoner that emits our fenced
+            # ```dbg / ```python blocks. If it could call its own tools it would
+            # trip --max-turns 1 and die with error_max_turns instead of
+            # answering. "" means "disable all tools" per `claude --help`.
+            "--tools", "",
         ]
         model = self._section.get("model")
         if model:
@@ -271,16 +277,23 @@ def _empty_output_error(meta, stderr_text, rc) -> str:
     parts = []
     rl = (meta or {}).get("rate_limit") or {}
     status = rl.get("status")
+    # NB: overage being "rejected"/out_of_credits while status=="allowed" is the
+    # NORMAL subscription state (pay-as-you-go off) — do NOT report it as an
+    # error. Only a status other than "allowed" is a real usage-limit block.
     if status and status != "allowed":
         parts.append(
             f"Claude usage limit hit (status={status}, "
             f"overage={rl.get('overageStatus')}, "
             f"reason={rl.get('overageDisabledReason')})"
         )
-    elif rl.get("overageDisabledReason") == "out_of_credits":
-        parts.append("Claude account appears out of credits for overage usage")
-    if (meta or {}).get("result_error"):
-        parts.append(str(meta["result_error"]))
+    result_error = (meta or {}).get("result_error")
+    if result_error:
+        if str(result_error) == "error_max_turns":
+            parts.append("CLI stopped with error_max_turns (it tried to use a "
+                         "built-in tool). Tools are disabled via --tools \"\"; "
+                         "if this persists, update the Claude CLI.")
+        else:
+            parts.append(str(result_error))
     if stderr_text and stderr_text.strip():
         parts.append(stderr_text.strip()[:300])
     if not parts:
