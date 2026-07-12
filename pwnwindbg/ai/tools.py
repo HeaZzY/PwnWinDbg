@@ -253,6 +253,11 @@ class DebugTools:
             "pid": getattr(dbg, "process_id", None),
             "arch": arch,
             "rip": rip,
+            # The RELIABLE faulting address from the last exception record. On
+            # emulated x86 (WoW64 on ARM) the Eip register is unreliable at a
+            # fault, so use THIS for cyclic offset finding after a crash.
+            "exception_addr": getattr(dbg, "last_exception_addr", None),
+            "exception_code": getattr(dbg, "last_exception_code", None),
             "has_tube": getattr(dbg, "tube", None) is not None,
         }
 

