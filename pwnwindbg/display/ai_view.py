@@ -13,6 +13,16 @@ from .common import (
     ADDR_COLOR, SYMBOL_COLOR, BANNER_COLOR, STRING_COLOR,
 )
 
+# When a live cockpit is active, the event functions below route their content
+# into it instead of printing linearly. Set via :func:`set_active`.
+_ACTIVE = None
+
+
+def set_active(cockpit):
+    """Install (or clear, with ``None``) the active live cockpit sink."""
+    global _ACTIVE
+    _ACTIVE = cockpit
+
 
 # Map an activity ``kind`` to a compact (label, style) pair. Reuses the shared
 # colour palette so the trace lines sit visually alongside ordinary output.
@@ -95,6 +105,8 @@ _reasoning_open = False
 
 def agent_header(task):
     """Print the banner announcing the start of an agent run."""
+    if _ACTIVE is not None:
+        return  # the cockpit shows the task itself
     banner("AI AGENT")
     console.print(
         Text.assemble(("task: ", "bold " + SYMBOL_COLOR), (str(task), STRING_COLOR))
@@ -103,6 +115,9 @@ def agent_header(task):
 
 def step_header(n, total):
     """Print a lightweight header marking the start of step ``n`` of ``total``."""
+    if _ACTIVE is not None:
+        _ACTIVE.step(n, total)
+        return
     _end_reasoning()
     console.print(
         Text.assemble(
@@ -124,6 +139,9 @@ def stream_reasoning(delta):
     global _reasoning_open
     if not delta:
         return
+    if _ACTIVE is not None:
+        _ACTIVE.reasoning(delta)
+        return
     console.print(delta, style=_REASONING_STYLE, end="", highlight=False, markup=False)
     _reasoning_open = True
 
@@ -143,6 +161,9 @@ def tool_call(kind, snippet):
         kind: The block kind, "dbg" or "python".
         snippet: The block's source text.
     """
+    if _ACTIVE is not None:
+        _ACTIVE.command(kind, snippet)
+        return
     _end_reasoning()
     label = "dbg" if kind == "dbg" else "python"
     console.print(
@@ -161,14 +182,34 @@ def tool_call(kind, snippet):
 
 
 def stream_tool_output(delta):
-    """Stream a chunk of tool (child-process) output live to the console."""
+    """Stream a chunk of tool (child-process) output live to the console.
+
+    Under a live cockpit this is a no-op: the python child's output arrives on a
+    daemon pump thread, and the cockpit (which reads debugger context) must only
+    be touched from the main loop thread. The full output is fed once, from the
+    main thread, via :func:`command_result` after the block completes.
+    """
     if not delta:
+        return
+    if _ACTIVE is not None:
         return
     console.print(delta, end="", highlight=False, markup=False)
 
 
+def command_result(out):
+    """Route a `dbg` block's result into the cockpit (no-op without one)."""
+    if _ACTIVE is not None and out:
+        _ACTIVE.output(out)
+
+
 def final_answer(text):
     """Render the agent's final answer inside a green panel."""
+    if _ACTIVE is not None:
+        # Close the live view first so the answer persists in scrollback.
+        try:
+            _ACTIVE.stop()
+        except Exception:
+            pass
     _end_reasoning()
     console.print(
         Panel(
@@ -185,6 +226,14 @@ def steer_prompt():
 
     Returns the raw string the user typed (empty string = resume).
     """
+    if _ACTIVE is not None:
+        # Reading input under a live layout would fight for the terminal; drop
+        # the cockpit and continue linearly for the rest of the run.
+        try:
+            _ACTIVE.stop()
+        except Exception:
+            pass
+        set_active(None)
     _end_reasoning()
     console.print(
         Text.assemble(

@@ -187,6 +187,7 @@ def run_agent(debugger, task):
 
     tools = DebugTools(debugger)
     server = None
+    cockpit = None
     prev_record = getattr(console, "record", False)
     prev_run_timeout = getattr(debugger, "run_timeout", None)
     prev_sigint = None
@@ -225,6 +226,19 @@ def run_agent(debugger, task):
         installed_sigint = True
     except Exception:
         installed_sigint = False
+
+    # Bring up the live cockpit (left: reasoning + issued commands, right:
+    # registers/stack/backtrace) unless disabled or there's no real terminal.
+    if bool(cfg.get("live_view", True)) and getattr(console, "is_terminal", False):
+        try:
+            from ..display.ai_cockpit import AgentCockpit
+            cockpit = AgentCockpit(debugger, task)
+            if cockpit.start():
+                ai_view.set_active(cockpit)
+            else:
+                cockpit = None
+        except Exception:
+            cockpit = None
 
     try:
         ai_view.agent_header(task)
@@ -305,6 +319,7 @@ def run_agent(debugger, task):
                         out = run_dbg_block(debugger, lines)
                     except Exception as exc:
                         out = f"[dbg error: {exc}]"
+                    ai_view.command_result(out)  # feeds the cockpit state panel
                     observations.append("[dbg output]\n" + out)
                 elif kind == "python":
                     if not code_exec:
@@ -317,6 +332,7 @@ def run_agent(debugger, task):
                         out = run_python_child(body, host, port, token, cfg)
                     except Exception as exc:
                         out = f"[python error: {exc}]"
+                    ai_view.command_result(out)  # main-thread cockpit update
                     observations.append("[python output]\n" + out)
 
             obs_text = "\n\n".join(observations).strip()
@@ -349,6 +365,12 @@ def run_agent(debugger, task):
     except Exception as exc:
         error(f"ai: unexpected error: {exc}")
     finally:
+        if cockpit is not None:
+            try:
+                cockpit.stop()
+            except Exception:
+                pass
+            ai_view.set_active(None)
         if server is not None:
             try:
                 server.stop()

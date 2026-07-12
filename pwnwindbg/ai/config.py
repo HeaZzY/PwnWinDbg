@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
     "provider": "claude_code",
     "max_steps": 30,
     "max_obs_chars": 6000,
+    # Live "cockpit" view during agent runs: left = the agent's reasoning + the
+    # commands it issues, right = a live registers/stack/backtrace panel. Falls
+    # back to linear output when there's no real terminal.
+    "live_view": True,
     # Cap how many past turns the HTTP providers resend each step. Older turns
     # beyond this (aside from the initial task) are dropped so long runs stay
     # fast and cheap. 0 disables trimming (resend the whole history).
