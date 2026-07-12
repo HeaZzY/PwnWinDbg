@@ -19,6 +19,10 @@ DEFAULT_CONFIG = {
     "provider": "claude_code",
     "max_steps": 30,
     "max_obs_chars": 6000,
+    # Cap how many past turns the HTTP providers resend each step. Older turns
+    # beyond this (aside from the initial task) are dropped so long runs stay
+    # fast and cheap. 0 disables trimming (resend the whole history).
+    "max_history_turns": 16,
     "python_timeout": 120,
     "continue_timeout": 15,
     "temperature": 0.2,

@@ -38,8 +38,18 @@ class OpenAISession(AgentSession):
         msgs = []
         if self.system_prompt:
             msgs.append({"role": "system", "content": self.system_prompt})
-        msgs.extend(self.messages)
+        msgs.extend(self._trimmed_history())
         return msgs
+
+    def _trimmed_history(self):
+        """Resend the whole history, or (for long runs) the initial task turn
+        plus the most recent ``max_history_turns`` turns, so latency/cost don't
+        grow without bound. ``max_history_turns`` <= 0 disables trimming."""
+        turns = int(self.cfg.get("max_history_turns", 0) or 0)
+        if turns <= 0 or len(self.messages) <= turns + 1:
+            return self.messages
+        # keep the first message (the task) + the last `turns` messages
+        return [self.messages[0]] + self.messages[-turns:]
 
     def send(self, user_text: str) -> Iterator[str]:
         self.messages.append({"role": "user", "content": user_text})
