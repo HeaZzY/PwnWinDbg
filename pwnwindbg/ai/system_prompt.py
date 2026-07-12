@@ -196,6 +196,28 @@ DRIVING A TARGET THAT READS STDIN (pwn workflow):
      process() works in this environment. Then VERIFY it end-to-end by running
      sh("python exploit.py") and confirming a success marker in the output.
 
+EXPLOITATION TECHNIQUES — run `checksec` FIRST to pick the right one:
+  * ret2win (DEP on or off, no ASLR): overwrite the saved return address with a
+    win/shell function. cdecl args go AFTER a fake return address:
+        payload = b"A"*offset + p32(win) + p32(0xdeadbeef) + p32(arg1) + p32(arg2)
+  * ret2shellcode (DEP off): put shellcode in your buffer and return to a fixed
+    `jmp esp`/`call esp` gadget (rop --search "jmp esp"); pad, then land in shell.
+  * ROP chain (DEP on / NX): build a chain of gadgets to call VirtualProtect (to
+    make the stack executable) or WinExec/system("cmd"). Use `rop` to list
+    gadgets, or pwntools: rop = ROP(exe); rop.raw(...); rop.call(...); then
+    payload = b"A"*offset + rop.chain(). Leak a module base first if ASLR is on.
+  * format string (program printf's YOUR input): first find your arg index by
+    sending "AAAA.%p.%p.%p.%p.%p.%p.%p" and seeing which %p prints 0x41414141;
+    leak with "%N$p" (stack/addresses to defeat ASLR), and get an arbitrary
+    write with pwntools fmtstr_payload(index, {addr: value}) to overwrite a
+    return address / function pointer / GOT-like slot with your target.
+  * SEH overwrite (Windows): overflow past the SEH record; set the handler to a
+    `pop pop ret` gadget and nSEH to a short jmp into your shellcode, then trigger
+    an exception so the corrupted handler runs.
+  Always: find the offset with cyclic, confirm control of EIP/RIP in the
+  debugger, build the payload, and VERIFY empirically (shell spawned / flag /
+  recv output) — never assume it worked.
+
 Current debugger state:
 {state_summary}
 
