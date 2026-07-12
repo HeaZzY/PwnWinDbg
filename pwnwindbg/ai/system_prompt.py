@@ -189,10 +189,18 @@ DRIVING A TARGET THAT READS STDIN (pwn workflow):
      <win>")) BEFORE continuing — if that breakpoint is hit, the hijack worked
      (win is valid code, so it does not fault the emulator). Then let it run and
      look for the flag / SHELL_POPPED marker in recv() output.
-  5. Find the target: inspect `iat`, strings, and xrefs to interesting strings
-     (system / WinExec / "cmd.exe"). A hidden function that spawns a shell is your
-     ret2win target. With DEP off you can alternatively jump to shellcode placed
-     in your buffer via a fixed `jmp esp` gadget (try `rop --search "jmp esp"`).
+  5. FIND THE WIN/TARGET FUNCTION FIRST — do this EARLY, before deep analysis.
+     A hidden win/admin function usually spawns a shell or prints a flag. Locate
+     it in one or two steps, don't decompile every function:
+       * `search -s cmd.exe` / `search -s flag` / `search -s /bin/sh` to find the
+         win string, then take the function that references it (the `sub_XXXX`
+         containing that address, or decompile candidates near it).
+       * or `iat` / decompile and look for a function that calls
+         system/WinExec/execve (the native decompiler flags these with `[!]`).
+     That function's ENTRY is your ret2win / function-pointer target. With DEP
+     off you can alternatively jump to shellcode in your buffer via a fixed
+     `jmp esp` gadget (try `rop --search "jmp esp"`). Small MinGW win functions
+     are listed in `info func` as sub_XXXX now — check there too.
   6. Deliver the final exploit as a GENUINE, idiomatic pwntools script via
      write_file("exploit.py", ...). It MUST start with `from pwn import *` and
      use a real pwntools tube: `io = process("ch72.exe")` for a local binary (or
