@@ -20,6 +20,7 @@ from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from . import mascot
 from .common import (
     console, ADDR_COLOR, SYMBOL_COLOR, BANNER_COLOR, STRING_COLOR,
     CHAIN_ARROW_COLOR,
@@ -43,9 +44,19 @@ class AgentCockpit:
         self._reasoning = ""                 # in-progress streamed line
         self._state = None                   # cached right-column renderable
         self._step = (0, 0)
+        self.mood = "idle"
+        self.status = "waking up…"
         self.live = None
         self.layout = Layout()
-        self.layout.split_row(
+        self.layout.split_column(
+            Layout(name="head", size=10),
+            Layout(name="body", ratio=1),
+        )
+        self.layout["head"].split_row(
+            Layout(name="mascot", size=20),
+            Layout(name="speech"),
+        )
+        self.layout["body"].split_row(
             Layout(name="activity", ratio=3),
             Layout(name="state", ratio=2, minimum_size=40),
         )
@@ -83,6 +94,8 @@ class AgentCockpit:
     def step(self, n, total):
         self._flush_reasoning()
         self._step = (n, total)
+        self.mood = "think"
+        self.status = f"step {n}/{total} · thinking…"
         self.log.append(Text.assemble(
             ("▶ step ", "bold " + BANNER_COLOR),
             (f"{n}", "bold " + ADDR_COLOR), ("/", BANNER_COLOR),
@@ -101,6 +114,9 @@ class AgentCockpit:
     def command(self, kind, snippet):
         """Highlight the command(s) the agent is issuing on our behalf."""
         self._flush_reasoning()
+        self.mood = "work"
+        first = next((l for l in str(snippet).splitlines() if l.strip()), "")
+        self.status = f"running: {first[:24]}" if first else "driving the debugger…"
         tag = "dbg" if kind == "dbg" else "py"
         for line in str(snippet).splitlines():
             if line.strip():
@@ -111,11 +127,18 @@ class AgentCockpit:
 
     def output(self, text):
         """Append (a tail of) a command's output, then refresh debugger state."""
+        self.status = "reading results…"
         lines = [ln for ln in str(text).splitlines() if ln.strip()]
         for ln in lines[-6:]:
             self.log.append(Text("    " + ln, style="bright_black",
                                  overflow="ellipsis", no_wrap=True))
         self._rebuild_state()
+        self._paint()
+
+    def win(self):
+        """Celebrate — the agent produced a final answer."""
+        self.mood = "win"
+        self.status = "done ★"
         self._paint()
 
     def note(self, text):
@@ -150,10 +173,37 @@ class AgentCockpit:
         body = Group(*tail) if tail else Text("")
         n, total = self._step
         title = f"AI agent — step {n}/{total}" if total else "AI agent"
+        # head band: mascot + a speech bubble showing the current status
+        try:
+            self.layout["mascot"].update(
+                Panel(Group(*mascot.render(self.mood)),
+                      border_style=BANNER_COLOR, padding=(0, 1)))
+            last = self._last_reasoning_line()
+            speech = Group(
+                Text(self.status, style="bold " + STRING_COLOR),
+                Text(last, style="dim cyan", overflow="ellipsis", no_wrap=True),
+            )
+            self.layout["speech"].update(
+                Panel(speech, title="slopdbg agent", border_style=BANNER_COLOR,
+                      padding=(0, 1)))
+        except Exception:
+            pass
         self.layout["activity"].update(
             Panel(body, title=title, border_style=BANNER_COLOR, padding=(0, 1)))
         self.layout["state"].update(self._state or Text(""))
         return self.layout
+
+    def _last_reasoning_line(self):
+        if self._reasoning.strip():
+            return "💭 " + self._reasoning.strip()
+        for item in reversed(self.log):
+            try:
+                s = item.plain.strip()
+            except Exception:
+                continue
+            if s and not s.startswith("▶"):
+                return "💭 " + s
+        return ""
 
     def _rebuild_state(self):
         """Recompute the right-hand register/stack/backtrace panel (read-only)."""

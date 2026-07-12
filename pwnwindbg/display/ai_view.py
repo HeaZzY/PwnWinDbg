@@ -205,8 +205,9 @@ def command_result(out):
 def final_answer(text):
     """Render the agent's final answer inside a green panel."""
     if _ACTIVE is not None:
-        # Close the live view first so the answer persists in scrollback.
+        # Celebrate, then close the live view so the answer persists.
         try:
+            _ACTIVE.win()
             _ACTIVE.stop()
         except Exception:
             pass
