@@ -545,18 +545,47 @@ def _invert(cond):
 
 
 def _structure(body):
-    """Rewrite the flat (addr,text) body into structured items with indent.
+    """Rewrite the flat (addr,text) body into structured C with real blocks.
 
-    Recognizes the MSVC for-loop, plain while-loop, and simple if-block idioms;
-    everything else stays as labels + goto. Returns a list of (addr, text,
-    indent). Guarded — returns the flat form on any failure.
+    Recognizes for/while loops and if / if-else diamonds, emitting braces
+    (`if (c) { ... } else { ... }`) instead of `if (c) goto L; ... L:` wherever
+    the jump targets are single-use and the spanned regions are brace-balanced.
+    Nested control flow is folded inside-out over repeated passes. Irreducible
+    flow degrades gracefully to label + goto. Returns a list of (addr_or_None,
+    text) with indentation baked in. Guarded — returns the flat form on failure.
     """
     try:
         items = [_classify(a, t) for (a, t) in body]
 
+        def _scan(start, n, want_kind, want_name, bail_kinds):
+            """Index of the first *depth-0* item of `want_kind` (name matched via
+            its ``name``/``target``), skipping over balanced open/close blocks.
+            Returns None if a depth-0 ``bail_kinds`` item — or a same-kind item
+            with the wrong name (a crossing boundary) — is hit first."""
+            depth = 0
+            for k in range(start, n):
+                it = items[k]
+                kk = it["k"]
+                if depth == 0:
+                    if kk == want_kind:
+                        if (want_name is None
+                                or it.get("name") == want_name
+                                or it.get("target") == want_name):
+                            return k
+                        return None      # right kind, wrong name -> crossing
+                    if kk in bail_kinds:
+                        return None
+                if kk == "open":
+                    depth += 1
+                elif kk == "close":
+                    depth -= 1
+                    if depth < 0:
+                        return None
+            return None
+
         changed = True
         passes = 0
-        while changed and passes < 50:
+        while changed and passes < 200:
             changed = False
             passes += 1
             uses = _label_uses(items)
@@ -641,26 +670,154 @@ def _structure(body):
             if changed:
                 continue
 
-            # --- if-block:  if(C) goto Lx ; <body no labels> ; Lx:
+            # --- general loop with a single back-edge (test-first while):
+            #     Lstart: <cond+body, exits via `goto Lend`> ; goto Lstart ; Lend:
+            #   -> while (1) { ...; if (Cexit) break; ...; if (Cback) continue; }
             uses = _label_uses(items)
-            for i in range(len(items)):
+            n = len(items)
+            for s in range(n):
+                if items[s]["k"] != "label":
+                    continue
+                Lstart = items[s]["name"]
+                # back-edge `goto Lstart` at depth 0 after s
+                depth = 0
+                b = None
+                for k in range(s + 1, n):
+                    kk = items[k]["k"]
+                    if depth == 0 and kk == "goto" \
+                            and items[k]["target"] == Lstart:
+                        b = k
+                        break
+                    if kk == "open":
+                        depth += 1
+                    elif kk == "close":
+                        depth -= 1
+                        if depth < 0:
+                            break
+                if b is None:
+                    continue
+                # the fall-through label after the back-edge = the break target
+                if b + 1 >= n or items[b + 1]["k"] != "label":
+                    continue
+                Lend = items[b + 1]["name"]
+                loop_body = items[s + 1:b]
+                # body must be brace-balanced and only escape to Lend / Lstart
+                depth = 0
+                okbody = True
+                for x in loop_body:
+                    kk = x["k"]
+                    if kk == "open":
+                        depth += 1
+                    elif kk == "close":
+                        depth -= 1
+                    elif depth == 0:
+                        if kk == "label":
+                            okbody = False
+                            break
+                        if kk in ("goto", "ifgoto") \
+                                and x.get("target") not in (Lend, Lstart):
+                            okbody = False
+                            break
+                    if depth < 0:
+                        okbody = False
+                        break
+                if not okbody or depth != 0:
+                    continue
+                # the loop head must only be re-entered by this back-edge
+                if uses.get(Lstart, 0) != 1:
+                    continue
+                # rewrite escapes: ->Lend => break, ->Lstart => continue
+                new_body = []
+                d2 = 0
+                for x in loop_body:
+                    kk = x["k"]
+                    if d2 == 0 and kk in ("goto", "ifgoto"):
+                        kw = "break" if x.get("target") == Lend else "continue"
+                        if kk == "goto":
+                            new_body.append({"k": "stmt", "text": kw + ";",
+                                             "addr": x.get("addr")})
+                        else:
+                            new_body.append({"k": "stmt", "addr": x.get("addr"),
+                                             "text": "if (%s) %s;" % (x["cond"], kw)})
+                    else:
+                        new_body.append(x)
+                    if kk == "open":
+                        d2 += 1
+                    elif kk == "close":
+                        d2 -= 1
+                head = {"k": "for", "text": "while (1) {",
+                        "addr": items[s].get("addr")}
+                new = [head, {"k": "open"}] + new_body + [{"k": "close", "text": "}"}]
+                items = items[:s] + new + items[b + 1:]
+                changed = True
+                break
+            if changed:
+                continue
+
+            # --- if / else diamond:
+            #     if(C) goto Lt ; <else> ; goto Le ; Lt: <then> ; Le:
+            uses = _label_uses(items)
+            n = len(items)
+            for i in range(n):
+                if items[i]["k"] != "ifgoto":
+                    continue
+                Lt = items[i]["target"]
+                # else-body ends at the first depth-0 `goto Le`
+                g = _scan(i + 1, n, "goto", None, ("label", "ifgoto", "ret"))
+                if g is None:
+                    continue
+                Le = items[g]["target"]
+                if Le == Lt:
+                    continue
+                # that `goto Le` must be immediately followed by `label Lt`
+                if g + 1 >= n or items[g + 1]["k"] != "label" \
+                        or items[g + 1]["name"] != Lt:
+                    continue
+                # then-body ends at the first depth-0 `label Le`
+                le = _scan(g + 2, n, "label", Le, ("goto", "ifgoto"))
+                if le is None:
+                    continue
+                if uses.get(Lt, 0) != 1 or uses.get(Le, 0) != 1:
+                    continue
+                else_body = items[i + 1:g]
+                then_body = items[g + 2:le]
+                if not then_body and not else_body:
+                    continue
+                addr = items[i]["addr"]
+                if then_body:
+                    new = [{"k": "if", "text": "if (%s) {" % items[i]["cond"],
+                            "addr": addr}, {"k": "open"}]
+                    new += then_body
+                    if else_body:
+                        new.append({"k": "close_else", "text": "} else {",
+                                    "addr": None})
+                        new += else_body
+                    new.append({"k": "close", "text": "}"})
+                else:
+                    # empty then -> invert and keep only the else body
+                    new = [{"k": "if",
+                            "text": "if (%s) {" % _invert(items[i]["cond"]),
+                            "addr": addr}, {"k": "open"}]
+                    new += else_body
+                    new.append({"k": "close", "text": "}"})
+                items = items[:i] + new + items[le + 1:]
+                changed = True
+                break
+            if changed:
+                continue
+
+            # --- simple if (no else):  if(C) goto Lx ; <body> ; Lx: ---
+            uses = _label_uses(items)
+            n = len(items)
+            for i in range(n):
                 if items[i]["k"] != "ifgoto":
                     continue
                 Lx = items[i]["target"]
-                kx = None
-                for k in range(i + 1, len(items)):
-                    if items[k]["k"] == "label" and items[k]["name"] == Lx:
-                        kx = k
-                        break
-                    if items[k]["k"] in ("label",):
-                        break
+                kx = _scan(i + 1, n, "label", Lx, ("goto", "ifgoto"))
                 if kx is None:
                     continue
                 inner = items[i + 1:kx]
-                if not inner or any(x["k"] in ("label", "goto", "ifgoto", "for")
-                                    for x in inner):
-                    continue
-                if uses.get(Lx, 0) != 1:
+                if not inner or uses.get(Lx, 0) != 1:
                     continue
                 new = [{"k": "if", "text": "if (%s) {" % _invert(items[i]["cond"]),
                         "addr": items[i]["addr"]}, {"k": "open"}]
@@ -669,6 +826,11 @@ def _structure(body):
                 items = items[:i] + new + items[kx + 1:]
                 changed = True
                 break
+
+        # Drop labels nothing jumps to anymore (structuring consumed them).
+        final_uses = _label_uses(items)
+        items = [it for it in items
+                 if it["k"] != "label" or final_uses.get(it.get("name"), 0) > 0]
 
         # Flatten with indentation.
         out = []
@@ -681,6 +843,11 @@ def _structure(body):
             if k == "close":
                 indent = max(1, indent - 1)
                 out.append((None, "    " * indent + "}"))
+                continue
+            if k == "close_else":
+                indent = max(1, indent - 1)
+                out.append((it.get("addr"), "    " * indent + "} else {"))
+                indent += 1
                 continue
             if k == "label":
                 out.append((None, it["text"]))
