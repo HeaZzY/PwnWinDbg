@@ -466,6 +466,75 @@ def name_thunks(exe_path, image_base, is_64=False):
                 pass
 
 
+_SINK_NAMES = (
+    "system", "_system", "_wsystem", "WinExec", "ShellExecuteA", "ShellExecuteW",
+    "ShellExecuteExA", "ShellExecuteExW", "CreateProcessA", "CreateProcessW",
+    "execl", "execlp", "execv", "execve", "execvp", "_execl", "_execlp",
+    "_execv", "_execve", "popen", "_popen",
+)
+
+
+def find_sink_callers(exe_path, image_base, is_64=False, starts=None):
+    """Map ``func_start -> [sink names]`` for functions that call a shell/exec
+    sink (system / WinExec / execve / …). These are the prime ret2win / hidden-
+    win targets a pwn agent wants. ``starts`` (discovered function heads) is used
+    to attribute each call site to its function; discovered if omitted. Never
+    raises.
+    """
+    import bisect
+    pe = None
+    try:
+        thunks = name_thunks(exe_path, image_base, is_64=is_64)
+        rev = {}
+        for a, nm in thunks.items():
+            rev.setdefault(nm, a)
+        sink_addrs = {rev[n]: n for n in _SINK_NAMES if n in rev}
+        if not sink_addrs:
+            return {}
+        if starts is None:
+            starts = sorted(discover_functions(exe_path, image_base, is_64=is_64))
+        else:
+            starts = sorted(starts)
+        if not starts:
+            return {}
+        pe = pefile.PE(exe_path, fast_load=True)
+        section = _find_text_section(pe)
+        if section is None:
+            return {}
+        data = section.get_data()
+        text_va = int(image_base) + int(section.VirtualAddress)
+        mode = CS_MODE_64 if is_64 else CS_MODE_32
+        md = Cs(CS_ARCH_X86, mode)
+        md.detail = True
+        result = {}
+        for ins in md.disasm(data, text_va):
+            if ins.mnemonic != "call":
+                continue
+            ops = ins.operands
+            if len(ops) != 1 or ops[0].type != X86_OP_IMM:
+                continue
+            tgt = ops[0].imm
+            nm = sink_addrs.get(tgt)
+            if nm is None:
+                continue
+            idx = bisect.bisect_right(starts, ins.address) - 1
+            if idx < 0:
+                continue
+            fn = starts[idx]
+            lst = result.setdefault(fn, [])
+            if nm not in lst:
+                lst.append(nm)
+        return result
+    except Exception:
+        return {}
+    finally:
+        if pe is not None:
+            try:
+                pe.close()
+            except Exception:
+                pass
+
+
 def estimate_bounds(func_starts_sorted, addr, text_hi):
     """Estimate the [start, end) bounds of the function containing ``addr``.
 

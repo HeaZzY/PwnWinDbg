@@ -209,6 +209,55 @@ def cmd_functions(debugger, args):
     return None
 
 
+def cmd_winfunc(debugger, args):
+    """List functions that call a shell/exec sink — likely ret2win/win targets.
+
+    Usage: winfunc   (aliases: wins, sinks)
+    """
+    if not debugger.exe_path or not os.path.exists(debugger.exe_path):
+        error("No executable path available")
+        return None
+    try:
+        debugger.analyze()
+    except Exception:
+        pass
+    from ..core.analysis import find_sink_callers
+    from rich.text import Text
+
+    base = getattr(debugger, "image_base", None) or 0
+    for mod in debugger.symbols.modules:
+        if mod.path and os.path.normcase(mod.path) == \
+                os.path.normcase(debugger.exe_path):
+            base = mod.base_address
+            break
+    starts = list(getattr(debugger.symbols, "discovered", {}) or {})
+    try:
+        sinks = find_sink_callers(
+            debugger.exe_path, base, is_64=not debugger.is_wow64, starts=starts)
+    except Exception as exc:
+        error(f"winfunc: {exc}")
+        return None
+
+    banner("WIN CANDIDATES (functions calling shell/exec sinks)")
+    if not sinks:
+        console.print("  none found (no system/WinExec/exec* call in user code)",
+                      style="bright_black")
+        return None
+    exe_name = os.path.basename(debugger.exe_path)
+    for fn in sorted(sinks):
+        name = debugger.symbols.discovered.get(fn, "sub_%X" % fn)
+        text = Text()
+        text.append(f"  {fn:#010x}", style="bright_cyan")
+        text.append(f"  {exe_name}!", style="bright_black")
+        text.append(name, style="bold bright_green")
+        text.append("   -> calls " + ", ".join(sinks[fn]), style="bright_red")
+        console.print(text)
+    console.print(
+        f"\n  [bright_black]{len(sinks)} candidate(s) — jump/return here to "
+        f"win (ret2win / fnptr target)[/]")
+    return None
+
+
 def cmd_analyze_funcs(debugger, args):
     """Discover functions in the main image: analyze-functions / afl
 

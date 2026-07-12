@@ -53,6 +53,7 @@ MODIFY / EXPLOIT
   asm <addr> "insns"      assemble & patch in place
 
 INFO
+  winfunc                 win targets: functions that call system/WinExec/exec
   vmmap                   memory map with protections
   modules / lm            loaded modules
   checksec [path]         PE mitigations (ASLR/DEP/CFG/SEH)
