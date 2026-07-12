@@ -35,6 +35,15 @@ DEFAULT_CONFIG = {
         "api_key_env": "MOONSHOT_API_KEY",
         "max_tokens": 4096,
     },
+    "glm": {
+        # Z.ai GLM Coding Plan (subscription) OpenAI-compatible endpoint.
+        # NOT the pay-as-you-go endpoint. See https://docs.z.ai/devpack/quick-start
+        "base_url": "https://api.z.ai/api/coding/paas/v4",
+        "model": "glm-5.2",
+        "api_key": "",
+        "api_key_env": "ZAI_API_KEY",
+        "max_tokens": 4096,
+    },
     "anthropic": {
         "base_url": "https://api.anthropic.com",
         "model": "claude-opus-4-8",

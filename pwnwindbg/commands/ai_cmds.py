@@ -6,7 +6,8 @@ Usage:
     ai config                       print effective config + path
     ai config path                  print the config file path
     ai config set <dotted> <value>  set a config value (e.g. openai.model foo)
-    ai use <provider>               switch provider (claude_code|openai|anthropic)
+    ai providers                    list all providers with model + key status
+    ai use <provider>               switch provider (claude_code|glm|openai|anthropic)
     ai model <name>                 set the current provider's model
     ai key <provider> <value>       store an API key for a provider
 """
@@ -17,13 +18,17 @@ from ..display.formatters import console, info, error, success, warn
 from ..ai import config as ai_config
 
 
-_SUBCOMMANDS = {"config", "use", "model", "key", "status"}
+# Selectable providers, in recommended order (fast HTTP first, subprocess last).
+KNOWN_PROVIDERS = ["glm", "openai", "anthropic", "claude_code"]
+
+_SUBCOMMANDS = {"config", "use", "model", "key", "status", "providers"}
 _USAGE = (
     'ai "<task>"  —  run the AI agent on a task\n'
     "  ai status                       provider / model / key / config path\n"
+    "  ai providers                    list providers + model + key status\n"
     "  ai config [path]                show effective config (or its path)\n"
     "  ai config set <dotted> <value>  set a config value\n"
-    "  ai use <provider>               claude_code | openai | anthropic\n"
+    "  ai use <provider>               glm | openai | anthropic | claude_code\n"
     "  ai model <name>                 set the current provider's model\n"
     "  ai key <provider> <value>       store an API key"
 )
@@ -91,10 +96,37 @@ def _cmd_config(cfg, args):
         error(f"could not render config: {exc}")
 
 
+def _cmd_providers(cfg):
+    """List every selectable provider with its model and key status."""
+    current = _current_provider(cfg)
+    info("AI providers")
+    for prov in KNOWN_PROVIDERS:
+        section = cfg.get(prov) if isinstance(cfg.get(prov), dict) else {}
+        model = section.get("model") or "(default)"
+        if prov == "claude_code":
+            key_note = "via claude CLI"
+        else:
+            try:
+                key_note = "key: yes" if ai_config.get_effective_key(cfg, prov) else "key: no"
+            except Exception:
+                key_note = "key: no"
+        base = section.get("base_url")
+        marker = "->" if prov == current else "  "
+        line = f"  {marker} {prov:<12} model={model:<22} {key_note}"
+        if base:
+            line += f"  {base}"
+        console.print(line)
+    console.print("\n  switch with:  ai use <provider>")
+
+
 def _cmd_use(cfg, args):
-    provider = args.strip()
+    provider = args.strip().lower()
     if not provider:
-        error("Usage: ai use <claude_code|openai|anthropic>")
+        error(f"Usage: ai use <{'|'.join(KNOWN_PROVIDERS)}>")
+        return
+    if provider not in KNOWN_PROVIDERS:
+        error(f"unknown provider {provider!r}. Choose one of: "
+              f"{', '.join(KNOWN_PROVIDERS)}")
         return
     try:
         ai_config.set_value(cfg, "provider", provider)
@@ -102,6 +134,13 @@ def _cmd_use(cfg, args):
     except Exception as exc:
         error(f"ai use: {exc}")
         return
+    # Nudge if the newly-selected provider has no key configured.
+    if provider != "claude_code":
+        try:
+            if not ai_config.get_effective_key(cfg, provider):
+                warn(f"note: no API key for {provider}. Set one: ai key {provider} <value>")
+        except Exception:
+            pass
     success(f"provider = {provider}")
 
 
@@ -158,6 +197,8 @@ def cmd_ai(debugger, args):
 
         if first == "status":
             _cmd_status(cfg)
+        elif first == "providers":
+            _cmd_providers(cfg)
         elif first == "config":
             _cmd_config(cfg, rest)
         elif first == "use":

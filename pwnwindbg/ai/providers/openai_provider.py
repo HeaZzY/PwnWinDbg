@@ -14,14 +14,24 @@ from .base import AgentSession, _effective_key
 
 
 class OpenAISession(AgentSession):
-    """Chat session against an OpenAI-compatible ``/chat/completions`` endpoint."""
+    """Chat session against an OpenAI-compatible ``/chat/completions`` endpoint.
+
+    Subclass and override :attr:`provider_name` / :attr:`default_base` /
+    :attr:`default_model` to point at another OpenAI-compatible backend (GLM,
+    DeepSeek, …) while reusing all of the SSE streaming machinery below.
+    """
+
+    #: config section name AND the key used for API-key resolution
+    provider_name = "openai"
+    default_base = "https://api.openai.com/v1"
+    default_model = "gpt-4o-mini"
 
     def __init__(self, cfg: dict, system_prompt: str):
         super().__init__(cfg, system_prompt)
-        self._section = (cfg or {}).get("openai") or {}
+        self._section = (cfg or {}).get(self.provider_name) or {}
 
     def _endpoint(self) -> str:
-        base = (self._section.get("base_url") or "https://api.openai.com/v1").rstrip("/")
+        base = (self._section.get("base_url") or self.default_base).rstrip("/")
         return base + "/chat/completions"
 
     def _build_messages(self):
@@ -34,14 +44,15 @@ class OpenAISession(AgentSession):
     def send(self, user_text: str) -> Iterator[str]:
         self.messages.append({"role": "user", "content": user_text})
 
-        key = _effective_key(self.cfg, "openai")
+        key = _effective_key(self.cfg, self.provider_name)
         if not key:
             raise RuntimeError(
-                "openai error: no API key. Set it with 'ai key openai <value>' "
-                "or export the configured api_key_env."
+                f"{self.provider_name} error: no API key. Set it with "
+                f"'ai key {self.provider_name} <value>' or export the "
+                "configured api_key_env."
             )
 
-        model = self._section.get("model") or "gpt-4o-mini"
+        model = self._section.get("model") or self.default_model
         body = {
             "model": model,
             "messages": self._build_messages(),
@@ -63,15 +74,16 @@ class OpenAISession(AgentSession):
         )
 
         assistant_parts = []
+        tag = self.provider_name
         try:
             resp = urllib.request.urlopen(req, timeout=600)
         except urllib.error.HTTPError as e:
             detail = _read_error_body(e)
-            raise RuntimeError(f"openai error: HTTP {e.code} {e.reason}: {detail}") from e
+            raise RuntimeError(f"{tag} error: HTTP {e.code} {e.reason}: {detail}") from e
         except urllib.error.URLError as e:
-            raise RuntimeError(f"openai error: connection failed: {e.reason}") from e
+            raise RuntimeError(f"{tag} error: connection failed: {e.reason}") from e
         except Exception as e:  # noqa: BLE001 - surface anything as RuntimeError
-            raise RuntimeError(f"openai error: {e}") from e
+            raise RuntimeError(f"{tag} error: {e}") from e
 
         try:
             for delta in _iter_sse_deltas(resp):
@@ -80,7 +92,7 @@ class OpenAISession(AgentSession):
         except RuntimeError:
             raise
         except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"openai error: stream read failed: {e}") from e
+            raise RuntimeError(f"{tag} error: stream read failed: {e}") from e
         finally:
             try:
                 resp.close()

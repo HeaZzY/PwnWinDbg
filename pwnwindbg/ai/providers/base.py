@@ -48,6 +48,9 @@ def create_session(cfg: dict, system_prompt: str) -> AgentSession:
     if provider == "openai":
         from .openai_provider import OpenAISession
         return OpenAISession(cfg, system_prompt)
+    if provider == "glm":
+        from .glm_provider import GLMSession
+        return GLMSession(cfg, system_prompt)
     if provider == "anthropic":
         from .anthropic_provider import AnthropicSession
         return AnthropicSession(cfg, system_prompt)
@@ -57,7 +60,7 @@ def create_session(cfg: dict, system_prompt: str) -> AgentSession:
 
     raise RuntimeError(
         f"unknown AI provider {provider!r}: expected one of "
-        "'openai', 'anthropic', 'claude_code'"
+        "'openai', 'glm', 'anthropic', 'claude_code'"
     )
 
 
