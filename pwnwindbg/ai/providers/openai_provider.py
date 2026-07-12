@@ -70,6 +70,16 @@ class OpenAISession(AgentSession):
             "max_tokens": self._section.get("max_tokens", 4096),
             "stream": True,
         }
+        # Anti-repetition penalties curb the model degenerating into a token
+        # loop ("3e3e3e…"). Only sent when non-zero so strict endpoints don't 400.
+        fp = self._section.get("frequency_penalty",
+                               self.cfg.get("frequency_penalty", 0.4))
+        pp = self._section.get("presence_penalty",
+                               self.cfg.get("presence_penalty", 0))
+        if fp:
+            body["frequency_penalty"] = fp
+        if pp:
+            body["presence_penalty"] = pp
         data = json.dumps(body).encode("utf-8")
 
         req = urllib.request.Request(
@@ -95,10 +105,26 @@ class OpenAISession(AgentSession):
         except Exception as e:  # noqa: BLE001 - surface anything as RuntimeError
             raise RuntimeError(f"{tag} error: {e}") from e
 
+        max_chars = int(self._section.get(
+            "max_reply_chars", self.cfg.get("max_reply_chars", 16000)) or 16000)
+        degenerate = False
         try:
+            total = 0
+            since_check = 0
             for delta in _iter_sse_deltas(resp):
                 assistant_parts.append(delta)
+                total += len(delta)
+                since_check += len(delta)
                 yield delta
+                # Stop a runaway: hard char cap, or a repetitive tail.
+                if total >= max_chars:
+                    degenerate = True
+                    break
+                if since_check >= 200:
+                    since_check = 0
+                    if _is_degenerate_tail("".join(assistant_parts)):
+                        degenerate = True
+                        break
         except RuntimeError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -109,7 +135,44 @@ class OpenAISession(AgentSession):
             except Exception:
                 pass
 
-        self.messages.append({"role": "assistant", "content": "".join(assistant_parts)})
+        full = "".join(assistant_parts)
+        if degenerate:
+            # Keep the useful prefix (it may hold a valid action block); drop the
+            # repetitive tail so it doesn't poison the conversation history.
+            full = _clean_degenerate(full)
+            yield "\n[note: reply truncated — it started repeating]\n"
+        self.messages.append({"role": "assistant", "content": full})
+
+
+def _is_degenerate_tail(text: str) -> bool:
+    """True if the end of ``text`` looks like runaway repetition.
+
+    Catches two failure modes: near-zero character diversity in the tail
+    (``3e3e3e…``), and a short unit tiling the last stretch of output.
+    """
+    if len(text) < 400:
+        return False
+    tail = text[-240:]
+    if len(set(tail)) <= 5:
+        return True
+    for p in range(1, 25):
+        seg = tail[-max(80, p * 10):]
+        unit = seg[-p:]
+        k = len(seg) // p
+        if k >= 6 and seg[-k * p:] == unit * k:
+            return True
+    return False
+
+
+def _clean_degenerate(text: str) -> str:
+    """Strip a runaway repetitive tail, keeping the useful prefix."""
+    for p in range(1, 25):
+        unit = text[-p:]
+        if unit and text.endswith(unit * 4):
+            while len(text) > p and text.endswith(unit * 2):
+                text = text[:-p]
+            break
+    return text.rstrip()
 
 
 def _iter_sse_deltas(resp) -> Iterator[str]:

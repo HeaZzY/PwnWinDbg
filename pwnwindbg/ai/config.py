@@ -36,12 +36,15 @@ DEFAULT_CONFIG = {
     # Native AI decompiler (see core/decompiler.py, commands/decompile_cmds.py).
     "decompile_auto": True,       # show the pseudo-C pane in the live context
     "decompile_max_insns": 400,   # cap on instructions decompiled per function
+    # Cap a single model reply so a runaway repetition loop can't flood the run.
+    "max_reply_chars": 16000,
     "openai": {
         "base_url": "https://api.moonshot.ai/v1",
         "model": "kimi-k2-0711-preview",
         "api_key": "",
         "api_key_env": "MOONSHOT_API_KEY",
         "max_tokens": 4096,
+        "frequency_penalty": 0.4,   # curb token-loop degeneration
     },
     "glm": {
         # Z.ai GLM Coding Plan (subscription) OpenAI-compatible endpoint.
@@ -51,6 +54,7 @@ DEFAULT_CONFIG = {
         "api_key": "",
         "api_key_env": "ZAI_API_KEY",
         "max_tokens": 4096,
+        "frequency_penalty": 0.4,   # curb token-loop degeneration
     },
     "anthropic": {
         "base_url": "https://api.anthropic.com",
