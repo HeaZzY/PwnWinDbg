@@ -567,6 +567,59 @@ def _dedup_call_in_branch(body):
     return out
 
 
+def _drop_unreachable(body):
+    """Remove statements no control-flow path can reach (dead code past a return
+    / tailcall that the function-bounds estimate over-ran into). Conservative:
+    bails entirely if a computed `goto *` is present (its targets are unknown).
+
+    Reachability = fixpoint over fall-through edges (a stmt/label/conditional
+    falls through to the next line) and resolved goto/ifgoto label targets.
+    """
+    n = len(body)
+    if n <= 1:
+        return body
+    kinds, tgts = [], []
+    labels = {}
+    for i, (a, t) in enumerate(body):
+        s = t.strip()
+        tg = None
+        if s.endswith(":") and s.startswith("L_"):
+            k = "label"
+            labels[s[:-1]] = i
+        elif s.startswith("if (") and "goto " in s:
+            k = "ifgoto"
+            tg = s.split("goto ", 1)[1].strip().split()[0].rstrip(";")
+        elif s.startswith("goto "):
+            k = "goto"
+            tg = s.split("goto ", 1)[1].strip().split()[0].rstrip(";")
+        elif s.startswith("return"):
+            k = "ret"
+        else:
+            k = "stmt"
+        if tg == "*" or (tg and tg.startswith("*")):
+            return body            # computed goto -> unknown targets, don't touch
+        kinds.append(k)
+        tgts.append(tg)
+    reach = [False] * n
+    reach[0] = True
+    changed = True
+    while changed:
+        changed = False
+        for i in range(n):
+            if not reach[i]:
+                continue
+            k = kinds[i]
+            if k in ("stmt", "ifgoto", "label") and i + 1 < n and not reach[i + 1]:
+                reach[i + 1] = True
+                changed = True
+            if k in ("goto", "ifgoto"):
+                j = labels.get(tgts[i])
+                if j is not None and not reach[j]:
+                    reach[j] = True
+                    changed = True
+    return [body[i] for i in range(n) if reach[i]]
+
+
 def _label_uses(items):
     uses = {}
     for it in items:
@@ -959,6 +1012,7 @@ def decompile_native(debugger, addr, max_insns=400):
             body = _collapse_init(body, ctx)   # unrolled zero-init -> memset()
             body = _strip_align_probe(body)    # drop GCC stack-align idiom
             body = _dedup_call_in_branch(body)  # call+if(call) -> just the if
+            body = _drop_unreachable(body)     # trim dead code past a return
             # header
             decls = []
             for v in sorted(ctx.decls):
