@@ -282,6 +282,11 @@ def run_agent(debugger, task):
                 warn("ai: interrupted during model response")
                 break
             except Exception as exc:
+                if cockpit is not None:
+                    try:
+                        cockpit.error(str(exc))
+                    except Exception:
+                        pass
                 error(f"ai: provider error: {exc}")
                 break
             full_text = "".join(full)

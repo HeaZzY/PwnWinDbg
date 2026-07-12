@@ -141,6 +141,12 @@ class AgentCockpit:
         self.status = "done ★"
         self._paint()
 
+    def error(self, msg=""):
+        """Show the sad/error face (agent hit a problem)."""
+        self.mood = "err"
+        self.status = ("error: " + str(msg))[:32] if msg else "error"
+        self._paint()
+
     def note(self, text):
         self.log.append(Text("  " + str(text), style="dim yellow"))
         self._paint()
