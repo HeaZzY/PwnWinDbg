@@ -443,6 +443,15 @@ class Debugger:
                     self.symbols.set_discovered({main_va: "main"})
             except Exception:
                 pass
+            # Name IAT jump-thunks after their import (ReadFile, printf, ...).
+            try:
+                thunks = analysis.name_thunks(
+                    self.exe_path, base, is_64=not self.is_wow64
+                )
+                if thunks:
+                    self.symbols.set_discovered(thunks)
+            except Exception:
+                pass
             self.symbols.analyzed_bases.add(base)
             return len(self.symbols.discovered)
         except Exception:

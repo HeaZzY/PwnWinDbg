@@ -66,6 +66,7 @@ class _Ctx:
         self.is64 = is64
         self.regexpr = {}      # reg name -> current expression string
         self.pushes = []       # pending pushed arg expressions (for the next call)
+        self.stack_args = {}   # cdecl: sp-disp -> arg expr, folded into next call
         self.decls = {}        # var name -> (decl string) for the header
         self.arrays = set()     # var names used with an index -> arrays
         self.array_sizes = {}  # array var name -> inferred size in bytes
@@ -76,6 +77,43 @@ def _reg_name(insn, op):
         return insn.reg_name(op.reg)
     except Exception:
         return "reg"
+
+
+def _sp_disp(ctx, insn, op):
+    """If `op` is a plain `[esp+disp]`/`[rsp+disp]` (no index), return disp."""
+    if op.type != X86_OP_MEM:
+        return None
+    m = op.mem
+    if m.index != 0:
+        return None
+    base = insn.reg_name(m.base) if m.base != 0 else None
+    sp = "esp" if not ctx.is64 else "rsp"
+    return m.disp if base == sp else None
+
+
+def _stringify(ctx, expr):
+    """If `expr` is a bare pointer immediate to a readable C string, quote it."""
+    if not isinstance(expr, str) or not re.match(r"^0x[0-9a-fA-F]+$", expr.strip()):
+        return expr
+    try:
+        addr = int(expr.strip(), 16)
+        data = read_memory_safe(getattr(ctx.debugger, "process_handle", None),
+                                addr, 64)
+    except Exception:
+        return expr
+    if not data:
+        return expr
+    nul = data.find(b"\x00")
+    raw = data[:nul] if nul >= 0 else data
+    if len(raw) < 2 or not all(0x20 <= b < 0x7f or b in (9, 10, 13) for b in raw):
+        return expr
+    text = raw.decode("ascii", "replace")
+    for a, b in (("\\", "\\\\"), ('"', '\\"'), ("\n", "\\n"),
+                 ("\t", "\\t"), ("\r", "\\r")):
+        text = text.replace(a, b)
+    if len(text) > 48:
+        text = text[:48] + "..."
+    return '"%s"' % text
 
 
 def _fmt_imm(v):
@@ -198,6 +236,11 @@ def _lift(ctx, insn, labels, cur_ip):
                 if d:
                     ctx.regexpr[d] = src
                     return []          # folded into the register; no statement
+                # cdecl arg: `mov [esp+k], val` -> fold into the next call.
+                sd = _sp_disp(ctx, insn, ops[0])
+                if sd is not None and sd >= 0:
+                    ctx.stack_args[sd] = src
+                    return []
                 dst = _opnd(ctx, insn, ops[0])
                 return ["%s = %s;" % (dst, src)]
         if m == "lea" and len(ops) == 2:
@@ -215,12 +258,15 @@ def _lift(ctx, insn, labels, cur_ip):
                 d = _dest_reg(insn, ops[0])
                 if d in ("esp", "rsp"):
                     return []      # hide stack-pointer cleanup (add/sub esp, N)
-                dst = _opnd(ctx, insn, ops[0])
                 src = _opnd(ctx, insn, ops[1])
-                if m == "xor" and d and src == dst:
-                    if d:
-                        ctx.regexpr[d] = "0"
+                # `xor reg, reg` (same register) is a zero-idiom.
+                if m == "xor" and d and ops[1].type == X86_OP_REG \
+                        and _reg_name(insn, ops[1]) == d:
+                    ctx.regexpr[d] = "0"
                     return []
+                # For a register dest, print the register name (not its stale
+                # folded value) so we never emit `0 += 0xf`.
+                dst = d if d else _opnd(ctx, insn, ops[0])
                 if d:
                     ctx.regexpr[d] = d      # stop folding after arithmetic
                 return ["%s %s= %s;" % (dst, cop, src)]
@@ -307,10 +353,18 @@ def _lift_call(ctx, insn, cur_ip):
         name = "(%s)" % _opnd(ctx, insn, ops[0])
     else:
         name = "??"
-    # cdecl: C args = pushes in reverse (last push = first arg is FALSE; first
-    # pushed is the LAST arg). We pushed in program order, so C order = reversed.
-    args = list(reversed(ctx.pushes))
+    # C args come either from pushes (stdcall/MSVC) or from `mov [esp+k], val`
+    # writes (cdecl/gcc). Pushes are in program order, so C order = reversed;
+    # stack_args are keyed by offset, so ascending offset = arg order.
+    if ctx.pushes:
+        args = [_stringify(ctx, a) for a in reversed(ctx.pushes)]
+    elif ctx.stack_args:
+        args = [_stringify(ctx, ctx.stack_args[k])
+                for k in sorted(ctx.stack_args)]
+    else:
+        args = []
     ctx.pushes = []
+    ctx.stack_args = {}
     call_expr = "%s(%s)" % (name, ", ".join(args))
     # live runtime values for the CURRENT call
     live = ""
@@ -411,6 +465,61 @@ def _classify(addr, text):
     if t.startswith("return"):
         return {"k": "ret", "addr": addr, "text": text}
     return {"k": "stmt", "addr": addr, "text": text}
+
+
+_ALIGN_ADD = re.compile(r"^\s*(\w+) \+= 0xf;\s*$")
+
+
+def _strip_align_probe(body):
+    """Drop GCC's ``__main``/alloca stack-alignment idiom, which Hex-Rays elides.
+
+    It compiles to ``reg = 0; reg += 0xf (x1-2); reg >>= 4; reg <<= 4;`` and an
+    optional spill to a dead local -- a rounded constant used only as an alloca
+    probe size. We recognize the ``>>= 4`` + ``<<= 4`` signature and remove it.
+    """
+    out, i, n = [], 0, len(body)
+    while i < n:
+        m = _ALIGN_ADD.match(body[i][1])
+        if m:
+            reg = m.group(1)
+            j = i
+            while j < n:
+                mm = _ALIGN_ADD.match(body[j][1])
+                if not mm or mm.group(1) != reg:
+                    break
+                j += 1
+            if (j + 1 < n and body[j][1].strip() == "%s >>= 4;" % reg
+                    and body[j + 1][1].strip() == "%s <<= 4;" % reg):
+                j += 2
+                if j < n and re.match(r"^\s*v_[0-9a-f]+ = %s;\s*$" % reg,
+                                      body[j][1]):
+                    j += 1
+                i = j          # skip the whole idiom
+                continue
+        out.append(body[i])
+        i += 1
+    return out
+
+
+def _dedup_call_in_branch(body):
+    """Drop a standalone ``EXPR;`` when the next line is ``if (EXPR ...)``.
+
+    A call whose result is immediately tested (``strcmp(...); if (strcmp(...) ==
+    0)``) is emitted twice; keep only the inlined form inside the branch.
+    """
+    out, i, n = [], 0, len(body)
+    while i < n:
+        cur = body[i][1].strip()
+        if i + 1 < n and cur.endswith(");"):
+            expr = cur[:-1]                       # "NAME(args)"
+            nxt = body[i + 1][1].strip()
+            if nxt.startswith("if (" + expr + " ") or \
+                    nxt.startswith("if (" + expr + ")"):
+                i += 1                            # inlined in the branch
+                continue
+        out.append(body[i])
+        i += 1
+    return out
 
 
 def _label_uses(items):
@@ -636,6 +745,8 @@ def decompile_native(debugger, addr, max_insns=400):
                 for s in stmts:
                     body.append((ins.address, "    " + s))
             body = _collapse_init(body, ctx)   # unrolled zero-init -> memset()
+            body = _strip_align_probe(body)    # drop GCC stack-align idiom
+            body = _dedup_call_in_branch(body)  # call+if(call) -> just the if
             # header
             decls = []
             for v in sorted(ctx.decls):
