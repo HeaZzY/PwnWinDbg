@@ -215,6 +215,86 @@ def discover_functions(exe_path, image_base, is_64=False, max_funcs=20000):
                 pass
 
 
+def detect_main(exe_path, image_base, is_64=False):
+    """Best-effort locate the user's ``main`` in an MSVC-compiled x86 PE.
+
+    The CRT entry point tail-jumps into ``__scrt_common_main_seh``, which calls
+    ``main(argc, argv, envp)`` — recognizable as a ``call <imm>`` immediately
+    preceded by three ``push`` instructions (the three arguments). Returns the
+    main VA (rebased to ``image_base``) or ``None``. x64 uses register args, so
+    this heuristic is skipped there. Never raises.
+    """
+    pe = None
+    try:
+        if not exe_path or not os.path.exists(exe_path):
+            return None
+        pe = pefile.PE(exe_path, fast_load=True)
+        if is_64 is None:
+            is_64 = int(pe.FILE_HEADER.Machine) == _MACHINE_AMD64
+        if is_64:
+            return None
+        section = _find_text_section(pe)
+        if section is None:
+            return None
+        data = section.get_data()
+        if not data:
+            return None
+        text_va = int(image_base) + int(section.VirtualAddress)
+        vsize = int(section.Misc_VirtualSize) or len(data)
+        text_lo, text_hi = text_va, text_va + vsize
+
+        md = Cs(CS_ARCH_X86, CS_MODE_32)
+        md.detail = True
+
+        entry = int(image_base) + int(pe.OPTIONAL_HEADER.AddressOfEntryPoint)
+        if not (text_lo <= entry < text_hi):
+            return None
+
+        # 1) From the entry point, follow the first jmp <imm> into the CRT
+        #    main wrapper (__scrt_common_main_seh).
+        wrapper = entry
+        eoff = entry - text_va
+        for ins in md.disasm(data[eoff:eoff + 64], entry):
+            if ins.mnemonic == "jmp":
+                ops = ins.operands
+                if len(ops) == 1 and ops[0].type == X86_OP_IMM:
+                    t = ops[0].imm
+                    if text_lo <= t < text_hi:
+                        wrapper = t
+                        break
+
+        # 2) In the wrapper, the FIRST `push;push;push; call <imm>` is the
+        #    call to main(argc, argv, envp). Take the first match and stop —
+        #    scanning further bleeds into other functions. `ret`/int3 ends it.
+        woff = wrapper - text_va
+        push_run = 0
+        for ins in md.disasm(data[woff:woff + 0x400], wrapper):
+            mn = ins.mnemonic
+            if mn == "push":
+                push_run += 1
+                continue
+            if mn == "call":
+                ops = ins.operands
+                if (push_run >= 3 and len(ops) == 1
+                        and ops[0].type == X86_OP_IMM
+                        and text_lo <= ops[0].imm < text_hi):
+                    return ops[0].imm
+                push_run = 0
+                continue
+            if mn in ("ret", "retn", "int3"):
+                break
+            push_run = 0
+        return None
+    except Exception:
+        return None
+    finally:
+        if pe is not None:
+            try:
+                pe.close()
+            except Exception:
+                pass
+
+
 def estimate_bounds(func_starts_sorted, addr, text_hi):
     """Estimate the [start, end) bounds of the function containing ``addr``.
 

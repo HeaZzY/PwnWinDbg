@@ -434,8 +434,17 @@ class Debugger:
                 self.exe_path, base, is_64=not self.is_wow64
             )
             self.symbols.set_discovered(funcs)
+            # Label the user's main() when we can find it (overrides sub_XXXX).
+            try:
+                main_va = analysis.detect_main(
+                    self.exe_path, base, is_64=not self.is_wow64
+                )
+                if main_va:
+                    self.symbols.set_discovered({main_va: "main"})
+            except Exception:
+                pass
             self.symbols.analyzed_bases.add(base)
-            return len(funcs)
+            return len(self.symbols.discovered)
         except Exception:
             return 0
 
