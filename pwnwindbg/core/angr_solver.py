@@ -23,8 +23,13 @@ def _hexint(x):
 
 
 def solve(exe, find, avoid=None, start=None, stdin_len=200, base=None,
-          argv=None, timeout=120):
-    """Return a result dict: {found, stdin_hex, stdin_len, ...} or {error}."""
+          argv=None, symargv=0, printable=True, timeout=120):
+    """Return a result dict: {found, stdin_hex, stdin_len, ...} or {error}.
+
+    ``symargv`` > 0 makes ``argv[1]`` a symbolic string of that many bytes so
+    the solver recovers a serial/key from an argv-based check; ``printable``
+    constrains those bytes to 0x20..0x7e.
+    """
     avoid = avoid or []
     try:
         import logging
@@ -44,8 +49,12 @@ def solve(exe, find, avoid=None, start=None, stdin_len=200, base=None,
         # A bounded, symbolic stdin so the solver can choose the input bytes.
         stdin = angr.SimFileStream(name="stdin", has_end=False)
 
+        sym_arg = None
         state_args = None
-        if argv:
+        if symargv and symargv > 0:
+            sym_arg = claripy.BVS("argv1", symargv * 8)
+            state_args = [exe, sym_arg]
+        elif argv:
             state_args = [exe] + list(argv)
 
         common_opts = {
@@ -63,6 +72,12 @@ def solve(exe, find, avoid=None, start=None, stdin_len=200, base=None,
             state = proj.factory.full_init_state(
                 args=state_args, stdin=stdin, add_options=common_opts
             )
+
+        if sym_arg is not None and printable:
+            for i in range(symargv):
+                byte = sym_arg.get_byte(i)
+                state.solver.add(byte >= 0x20)
+                state.solver.add(byte <= 0x7e)
 
         simgr = proj.factory.simulation_manager(state, save_unconstrained=True)
 
@@ -107,6 +122,14 @@ def solve(exe, find, avoid=None, start=None, stdin_len=200, base=None,
                 res["stdin_repr"] = repr(stdin_bytes)
             except Exception:
                 pass
+            # recover the symbolic argv[1] if we used one
+            if sym_arg is not None:
+                try:
+                    argb = s.solver.eval(sym_arg, cast_to=bytes)
+                    res["argv1_hex"] = argb.hex()
+                    res["argv1_repr"] = repr(argb)
+                except Exception:
+                    pass
             return res
         info = {"found": False, "reason": "no path (explored %d steps)" % steps}
         try:
@@ -132,6 +155,8 @@ def main(argv=None):
     ap.add_argument("--base", type=_hexint, default=None,
                     help="force image base (match the live load base)")
     ap.add_argument("--argv", default="", help="comma-separated argv (after exe)")
+    ap.add_argument("--symargv", type=int, default=0,
+                    help="make argv[1] symbolic, this many bytes (recover a key)")
     ap.add_argument("--timeout", type=int, default=120)
     args = ap.parse_args(argv)
 
@@ -140,7 +165,7 @@ def main(argv=None):
     res = solve(
         args.exe, args.find, avoid=avoid, start=args.start,
         stdin_len=args.stdin_len, base=args.base, argv=argv_extra,
-        timeout=args.timeout,
+        symargv=args.symargv, timeout=args.timeout,
     )
     sys.stdout.write(json.dumps(res))
     sys.stdout.flush()

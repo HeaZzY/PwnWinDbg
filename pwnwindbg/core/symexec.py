@@ -57,12 +57,13 @@ def _solver_path():
 
 
 def solve_payload(exe_path, target, avoid=None, start=None, base=None,
-                  stdin_len=200, timeout=120):
+                  stdin_len=200, symargv=0, timeout=120):
     """Run the angr solver in the venv. Returns the result dict.
 
     Result keys: ``found`` (bool), ``stdin_hex``/``stdin_len``/``stdin_repr``
-    when found, ``reason`` when not, or ``error`` on failure (including when the
-    angr venv is missing).
+    when found (plus ``argv1_hex``/``argv1_repr`` when ``symargv`` > 0), or
+    ``reason`` when not, or ``error`` on failure (incl. a missing angr venv).
+    ``symargv`` > 0 makes ``argv[1]`` a symbolic key of that many bytes.
     """
     vpy = find_angr_python()
     if not vpy:
@@ -80,6 +81,8 @@ def solve_payload(exe_path, target, avoid=None, start=None, base=None,
         argv += ["--start", hex(int(start))]
     if base is not None:
         argv += ["--base", hex(int(base))]
+    if symargv:
+        argv += ["--symargv", str(int(symargv))]
     argv += ["--stdin-len", str(int(stdin_len)), "--timeout", str(int(timeout))]
 
     try:

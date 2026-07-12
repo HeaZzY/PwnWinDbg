@@ -27,10 +27,11 @@ _SETUP = (
 def _usage():
     info("angr — symbolic payload solver")
     console.print(
-        "  angr <target> [from <addr>] [avoid <a1>,<a2>] [send] [timeout <sec>]\n"
+        "  angr <target> [from <addr>] [avoid <a1>,<a2>] [key <N>] [send] [timeout <sec>]\n"
         "  angr status | setup\n"
-        "  Finds the stdin bytes that reach <target>. `send` pipes them to the\n"
-        "  running debuggee's stdin (needs `run -i`)."
+        "  Finds the stdin bytes that reach <target>. `key <N>` instead solves\n"
+        "  for an N-byte argv[1] (serial/key crackmes). `send` pipes the stdin\n"
+        "  payload to the running debuggee (needs `run -i`)."
     )
 
 
@@ -79,6 +80,7 @@ def cmd_angr(debugger, args):
     avoid = []
     send = False
     timeout = 120
+    symargv = 0
     i = 1
     while i < len(toks):
         t = toks[i].lower()
@@ -89,6 +91,12 @@ def cmd_angr(debugger, args):
                 v = eval_expr(debugger, a.strip())
                 if v is not None:
                     avoid.append(v)
+            i += 2; continue
+        if t == "key" and i + 1 < len(toks):
+            try:
+                symargv = int(toks[i + 1], 0)
+            except ValueError:
+                pass
             i += 2; continue
         if t == "send":
             send = True; i += 1; continue
@@ -101,13 +109,14 @@ def cmd_angr(debugger, args):
         i += 1
 
     base = _exe_base(debugger)
-    info(f"angr: solving stdin to reach {target:#x} "
+    what = f"a {symargv}-byte argv[1] key" if symargv else "stdin"
+    info(f"angr: solving {what} to reach {target:#x} "
          f"(timeout {timeout}s){' from ' + hex(start) if start else ''}… "
          "this can take a while")
 
     res = symexec.solve_payload(
         debugger.exe_path, target, avoid=avoid, start=start,
-        base=base, timeout=timeout,
+        base=base, symargv=symargv, timeout=timeout,
     )
 
     if res.get("error"):
@@ -115,6 +124,13 @@ def cmd_angr(debugger, args):
         return None
     if not res.get("found"):
         warn("angr: no input found — " + str(res.get("reason", "unknown")))
+        return None
+
+    if symargv and res.get("argv1_hex"):
+        argb = bytes.fromhex(res["argv1_hex"])
+        success(f"angr: found a {len(argb)}-byte argv[1] key reaching {target:#x}")
+        console.print(f"  key repr : {res.get('argv1_repr', repr(argb))}")
+        console.print(f"  key hex  : {argb.hex()}")
         return None
 
     hexs = res.get("stdin_hex", "")
