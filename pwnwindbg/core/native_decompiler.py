@@ -341,6 +341,47 @@ def _callee_name(ctx, tgt):
     return "sub_%X" % tgt
 
 
+# Unsafe libc/Win32 functions worth flagging in the pseudo-C so overflow /
+# command-injection sinks stand out. scanf-family is handled separately (only
+# risky with an unbounded %s), so it is not listed here.
+_DANGEROUS = {
+    "gets": "unbounded stdin read -> stack overflow",
+    "strcpy": "no bounds check -> overflow",
+    "stpcpy": "no bounds check -> overflow",
+    "strcat": "no bounds check -> overflow",
+    "sprintf": "no bounds check -> overflow",
+    "vsprintf": "no bounds check -> overflow",
+    "system": "shell command execution",
+    "popen": "shell command execution",
+    "execl": "command execution",
+    "execlp": "command execution",
+    "execve": "command execution",
+    "execvp": "command execution",
+    "WinExec": "command execution",
+    "ShellExecuteA": "command execution",
+    "ShellExecuteW": "command execution",
+    "strncpy": "may leave dst non-NUL-terminated",
+    "memcpy": "verify the length is bounded",
+    "alloca": "stack alloc sized from input",
+}
+
+# scanf-family reads; risky only when the format has an unbounded %s.
+_SCANF_FAMILY = ("scanf", "sscanf", "fscanf", "vscanf", "vsscanf", "vfscanf",
+                 "wscanf", "swscanf")
+
+
+def _call_risk(name, args):
+    """Return a short risk note for a call to a known-unsafe function, else None."""
+    base = name.split("(")[0].lstrip("_").lower()
+    if base in _SCANF_FAMILY:
+        fmt = args[0] if args else ""
+        # `%s` without a field width (e.g. `%20s` would not contain `%s`).
+        if isinstance(fmt, str) and "%s" in fmt:
+            return "unbounded %s field -> buffer overflow"
+        return None
+    return _DANGEROUS.get(base)
+
+
 def _lift_call(ctx, insn, cur_ip):
     ops = insn.operands
     # resolve target name
@@ -376,8 +417,12 @@ def _lift_call(ctx, insn, cur_ip):
     ctx.regexpr["eax"] = call_expr
     ctx.regexpr["rax"] = call_expr
     stmt = call_expr + ";"
-    if live:
-        stmt += "  // " + live
+    comment = live
+    risk = _call_risk(name, args)
+    if risk:
+        comment = (comment + "; " if comment else "") + "[!] " + risk
+    if comment:
+        stmt += "  // " + comment
     return [stmt]
 
 
@@ -933,7 +978,11 @@ def decompile_native(debugger, addr, max_insns=400):
                     out_lines.append(t)
                 else:
                     amap.append((a, len(out_lines)))
-                    out_lines.append("%s // @0x%x" % (t, a))
+                    # fold the address into an existing inline comment if any
+                    if "//" in t:
+                        out_lines.append("%s @0x%x" % (t, a))
+                    else:
+                        out_lines.append("%s // @0x%x" % (t, a))
             out_lines.append("}")
             result = {
                 "start": start, "end": end,
