@@ -209,7 +209,7 @@ EXPLOITATION TECHNIQUES — run `checksec` FIRST to pick the right one:
   * format string (program printf's YOUR input): first find your arg index by
     sending "AAAA.%p.%p.%p.%p.%p.%p.%p" and seeing which %p prints 0x41414141;
     leak with "%N$p" (stack/addresses to defeat ASLR), and get an arbitrary
-    write with pwntools fmtstr_payload(index, {addr: value}) to overwrite a
+    write with pwntools fmtstr_payload(index, {{addr: value}}) to overwrite a
     return address / function pointer / GOT-like slot with your target.
   * SEH overwrite (Windows): overflow past the SEH record; set the handler to a
     `pop pop ret` gadget and nSEH to a short jmp into your shellcode, then trigger
