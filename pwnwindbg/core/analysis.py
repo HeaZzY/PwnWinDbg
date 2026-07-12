@@ -36,7 +36,8 @@ _MACHINE_I386 = 0x14C
 # Kept multi-byte and conservative to avoid flooding the result with junk.
 _PROLOGUE_SIGS = (
     b"\x8b\xff\x55\x8b\xec",  # hotpatch: mov edi,edi; push ebp; mov ebp,esp
-    b"\x55\x8b\xec",          # push ebp; mov ebp,esp  (also AT&T 55 89 e5 == 55 8b ec)
+    b"\x55\x8b\xec",          # push ebp; mov ebp,esp  (MSVC encoding)
+    b"\x55\x89\xe5",          # push ebp; mov ebp,esp  (GCC/MinGW encoding)
     b"\xf3\x0f\x1e\xfb",      # endbr32
     b"\xf3\x0f\x1e\xfa",      # endbr64
 )
