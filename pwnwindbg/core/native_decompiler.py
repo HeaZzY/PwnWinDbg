@@ -13,6 +13,7 @@ structuring. Result shape matches display/decompile_view.py:
 """
 
 import hashlib
+import re
 
 try:
     from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64
@@ -67,6 +68,7 @@ class _Ctx:
         self.pushes = []       # pending pushed arg expressions (for the next call)
         self.decls = {}        # var name -> (decl string) for the header
         self.arrays = set()     # var names used with an index -> arrays
+        self.array_sizes = {}  # array var name -> inferred size in bytes
 
 
 def _reg_name(insn, op):
@@ -353,6 +355,238 @@ def _live_args(ctx, name):
         return ""
 
 
+_INIT_RE = re.compile(r"^\s*v_([0-9a-f]+) = (?:0|ax|al|eax|ecx|edx|xmm0);?\s*$")
+
+
+def _collapse_init(body, ctx):
+    """Collapse an unrolled zero-init run into a single memset(&buf, 0, N)."""
+    out = []
+    i = 0
+    n = len(body)
+    while i < n:
+        m = _INIT_RE.match(body[i][1])
+        if m:
+            j = i
+            offs = []
+            while j < n:
+                mj = _INIT_RE.match(body[j][1])
+                if not mj:
+                    break
+                offs.append(int(mj.group(1), 16))
+                j += 1
+            if len(offs) >= 3:
+                base_off = max(offs)
+                size = base_off - min(offs) + 1
+                base = "v_%x" % base_off
+                ctx.arrays.add(base)
+                ctx.array_sizes[base] = size
+                for o in offs:
+                    if o != base_off:
+                        ctx.decls.pop("v_%x" % o, None)
+                out.append((body[i][0], "    memset(&%s, 0, %#x);" % (base, size)))
+                i = j
+                continue
+        out.append(body[i])
+        i += 1
+    return out
+
+
+def _classify(addr, text):
+    """Classify a body line into a structural item for the structurer."""
+    t = text.strip()
+    if t.endswith(":") and t.startswith("L_"):
+        return {"k": "label", "name": t[:-1], "addr": addr, "text": text}
+    if t.startswith("if (") and "goto L_" in t:
+        cond = t[4:t.rindex(")")] if ")" in t else "cond"
+        # `if (COND) goto L_x;`
+        try:
+            cond = t[t.index("(") + 1:t.rindex(") goto")]
+        except Exception:
+            pass
+        tgt = t.split("goto", 1)[1].strip().rstrip(";").strip()
+        return {"k": "ifgoto", "cond": cond, "target": tgt, "addr": addr, "text": text}
+    if t.startswith("goto L_"):
+        tgt = t.split("goto", 1)[1].strip().rstrip(";").strip()
+        return {"k": "goto", "target": tgt, "addr": addr, "text": text}
+    if t.startswith("return"):
+        return {"k": "ret", "addr": addr, "text": text}
+    return {"k": "stmt", "addr": addr, "text": text}
+
+
+def _label_uses(items):
+    uses = {}
+    for it in items:
+        if it["k"] in ("goto", "ifgoto"):
+            uses[it["target"]] = uses.get(it["target"], 0) + 1
+    return uses
+
+
+def _invert(cond):
+    cond = cond.strip()
+    inv = {"==": "!=", "!=": "==", "<": ">=", ">=": "<", ">": "<=", "<=": ">"}
+    for op in ("==", "!=", "<=", ">=", "<", ">"):
+        if (" %s " % op) in cond:
+            a, b = cond.split(" %s " % op, 1)
+            return "%s %s %s" % (a, inv[op], b)
+    if cond.endswith(">= 0"):
+        return cond[:-4] + "< 0"
+    if cond.endswith("< 0"):
+        return cond[:-3] + ">= 0"
+    return "!(%s)" % cond
+
+
+def _structure(body):
+    """Rewrite the flat (addr,text) body into structured items with indent.
+
+    Recognizes the MSVC for-loop, plain while-loop, and simple if-block idioms;
+    everything else stays as labels + goto. Returns a list of (addr, text,
+    indent). Guarded — returns the flat form on any failure.
+    """
+    try:
+        items = [_classify(a, t) for (a, t) in body]
+
+        changed = True
+        passes = 0
+        while changed and passes < 50:
+            changed = False
+            passes += 1
+            uses = _label_uses(items)
+            n = len(items)
+
+            # --- for-loop:  init? ; goto Lc ; Lb: incr ; Lc: if(Cexit) goto La ;
+            #                body ; goto Lb ; La:
+            for i in range(n):
+                if items[i]["k"] != "goto":
+                    continue
+                Lc = items[i]["target"]
+                # find Lb label right after i
+                j = i + 1
+                if j >= n or items[j]["k"] != "label":
+                    continue
+                Lb = items[j]["name"]
+                # find Lc label
+                kc = None
+                for k in range(j + 1, n):
+                    if items[k]["k"] == "label" and items[k]["name"] == Lc:
+                        kc = k
+                        break
+                if kc is None:
+                    continue
+                incr = items[j + 1:kc]
+                if any(x["k"] not in ("stmt",) for x in incr):
+                    continue
+                # keep only the real increment expr(s) (drop copy-prop artifacts)
+                incr_real = [x for x in incr if any(
+                    op in x["text"] for op in ("+=", "-=", "++", "--"))]
+                if incr_real:
+                    incr = incr_real
+                # Lc must be followed by if(Cexit) goto La
+                if kc + 1 >= n or items[kc + 1]["k"] != "ifgoto":
+                    continue
+                guard = items[kc + 1]
+                La = guard["target"]
+                # body until `goto Lb`
+                ke = None
+                for k in range(kc + 2, n):
+                    if items[k]["k"] == "goto" and items[k]["target"] == Lb:
+                        ke = k
+                        break
+                    if items[k]["k"] == "label":
+                        break
+                if ke is None:
+                    continue
+                body_items = items[kc + 2:ke]
+                if any(x["k"] == "label" for x in body_items):
+                    continue
+                # La label should follow the goto Lb
+                if ke + 1 >= n or items[ke + 1]["k"] != "label" or \
+                        items[ke + 1]["name"] != La:
+                    continue
+                # labels Lb/Lc must only be used by this loop
+                if uses.get(Lb, 0) != 1 or uses.get(Lc, 0) != 1:
+                    continue
+                init = None
+                # optional init: the stmt immediately before `goto Lc`
+                start = i
+                if i > 0 and items[i - 1]["k"] == "stmt":
+                    init = items[i - 1]
+                    start = i - 1
+                incr_txt = ", ".join(x["text"].strip().rstrip(";") for x in incr)
+                cond = _invert(guard["cond"])
+                head_addr = guard["addr"]
+                new = []
+                if init is not None:
+                    new.append({"k": "for", "text": "for (%s; %s; %s) {" % (
+                        init["text"].strip().rstrip(";"), cond, incr_txt),
+                        "addr": head_addr})
+                else:
+                    new.append({"k": "for", "text": "while (%s) {" % cond,
+                                "addr": head_addr})
+                new.append({"k": "open"})
+                for x in body_items:
+                    new.append(x)
+                new.append({"k": "close", "text": "}"})
+                items = items[:start] + new + items[ke + 2:]
+                changed = True
+                break
+            if changed:
+                continue
+
+            # --- if-block:  if(C) goto Lx ; <body no labels> ; Lx:
+            uses = _label_uses(items)
+            for i in range(len(items)):
+                if items[i]["k"] != "ifgoto":
+                    continue
+                Lx = items[i]["target"]
+                kx = None
+                for k in range(i + 1, len(items)):
+                    if items[k]["k"] == "label" and items[k]["name"] == Lx:
+                        kx = k
+                        break
+                    if items[k]["k"] in ("label",):
+                        break
+                if kx is None:
+                    continue
+                inner = items[i + 1:kx]
+                if not inner or any(x["k"] in ("label", "goto", "ifgoto", "for")
+                                    for x in inner):
+                    continue
+                if uses.get(Lx, 0) != 1:
+                    continue
+                new = [{"k": "if", "text": "if (%s) {" % _invert(items[i]["cond"]),
+                        "addr": items[i]["addr"]}, {"k": "open"}]
+                new += inner
+                new.append({"k": "close", "text": "}"})
+                items = items[:i] + new + items[kx + 1:]
+                changed = True
+                break
+
+        # Flatten with indentation.
+        out = []
+        indent = 1
+        for it in items:
+            k = it["k"]
+            if k == "open":
+                indent += 1
+                continue
+            if k == "close":
+                indent = max(1, indent - 1)
+                out.append((None, "    " * indent + "}"))
+                continue
+            if k == "label":
+                out.append((None, it["text"]))
+                continue
+            pad = "    " * indent
+            if k in ("for", "if"):
+                out.append((it.get("addr"), pad + it["text"]))
+            else:
+                out.append((it.get("addr"), pad + it["text"].strip()))
+        return out
+    except Exception:
+        return [(a, "    " + t.strip()) if not t.strip().endswith(":")
+                else (None, t) for (a, t) in body]
+
+
 def decompile_native(debugger, addr, max_insns=400):
     """Fast native pseudo-C for the function containing `addr`. Never raises."""
     if not _CAPSTONE:
@@ -401,21 +635,23 @@ def decompile_native(debugger, addr, max_insns=400):
                 stmts = _lift(ctx, ins, labels, None)  # structural pass: no live
                 for s in stmts:
                     body.append((ins.address, "    " + s))
+            body = _collapse_init(body, ctx)   # unrolled zero-init -> memset()
             # header
             decls = []
             for v in sorted(ctx.decls):
                 if v in ctx.arrays:
-                    decls.append("    char %s[/*?*/];" % v)
+                    sz = ctx.array_sizes.get(v)
+                    decls.append("    char %s[%s];" % (
+                        v, ("%#x" % sz) if sz else "/*?*/"))
                 else:
                     decls.append("    int %s;" % v)
             header = ["%s()" % name, "{"] + decls + ([""] if decls else [])
-            # Build code with addr annotations line-by-line.
-            out_lines = []
+            # Structure the flat goto body into for/while/if where recognizable.
+            structured = _structure(body)
+            out_lines = list(header)
             amap = []
-            for h in header:
-                out_lines.append(h)
-            for a, t in body:
-                if t.endswith(":"):
+            for a, t in structured:
+                if a is None:
                     out_lines.append(t)
                 else:
                     amap.append((a, len(out_lines)))
