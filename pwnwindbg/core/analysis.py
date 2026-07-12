@@ -18,10 +18,12 @@ import re
 import pefile
 from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64
 
-try:  # operand-type constant for immediate targets
-    from capstone.x86 import X86_OP_IMM
+try:  # operand-type constants
+    from capstone.x86 import X86_OP_IMM, X86_OP_REG, X86_OP_MEM
 except Exception:  # pragma: no cover - fallback if layout differs
     X86_OP_IMM = 2
+    X86_OP_REG = 1
+    X86_OP_MEM = 3
 
 # PE section characteristic flags
 _IMAGE_SCN_MEM_EXECUTE = 0x20000000
@@ -217,24 +219,31 @@ def discover_functions(exe_path, image_base, is_64=False, max_funcs=20000):
 
 
 def _detect_main_gcc(data, text_va, text_lo, text_hi, md, thunks):
-    """Locate ``main`` in a MinGW/gcc x86 PE using the CRT startup shape.
+    """Locate ``main`` in a MinGW/gcc x86 PE from the CRT startup shape.
 
-    ``__mingw_CRTStartup`` calls ``__getmainargs`` to populate argc/argv, then
-    later calls ``main(argc, argv, envp)`` and hands its return value to
-    ``exit``/``ExitProcess``. So within the function that calls ``__getmainargs``,
-    ``main`` is the last *direct* call into user code before the exit call.
+    Across MinGW versions the CRT startup calls ``main(argc, argv, envp)`` and
+    hands its return value to ``exit``/``ExitProcess``, compiling to:
+
+        call main            ; <- main
+        mov  <reg>, eax      ; capture the exit code
+        ... (a few insns) ...
+        call exit/_cexit/ExitProcess
+
+    So ``main`` is the direct user-code call whose result is copied out of eax
+    and, within a short window, passed to an exit-family import. This is robust
+    to how far ``main`` sits from ``__getmainargs`` (which varies by version).
     ``thunks`` maps IAT-jump-thunk VA -> import name. Returns the main VA or None.
     """
     rev = {}
     for a, nm in thunks.items():
         rev.setdefault(nm, a)
-    gma = rev.get("__getmainargs")
-    if gma is None:
-        return None
-    exit_thunks = {
+    gma_addrs = {rev[n] for n in ("__getmainargs", "__wgetmainargs") if n in rev}
+    exit_addrs = {
         rev[n] for n in ("exit", "_exit", "ExitProcess", "_cexit", "_amsg_exit")
         if n in rev
     }
+    if not gma_addrs and not exit_addrs:
+        return None
     thunk_addrs = set(thunks)
 
     def _imm_call(ins):
@@ -243,28 +252,58 @@ def _detect_main_gcc(data, text_va, text_lo, text_hi, md, thunks):
             return ops[0].imm
         return None
 
-    # 1) Find the `call __getmainargs` site.
-    call_site = None
-    for ins in md.disasm(data, text_va):
-        if _imm_call(ins) == gma:
-            call_site = ins.address
-            break
-    if call_site is None:
-        return None
+    def _writes_esp0(ins):
+        """True for `mov dword ptr [esp], <imm/reg>` (the argc cdecl arg)."""
+        if ins.mnemonic != "mov" or len(ins.operands) != 2:
+            return False
+        dst = ins.operands[0]
+        if dst.type != X86_OP_MEM:
+            return False
+        m = dst.mem
+        return (ins.reg_name(m.base) == "esp" and m.index == 0 and m.disp == 0)
 
-    # 2) Forward from there, the last user-code call before an exit call = main.
-    off = call_site - text_va
-    last_user_call = None
-    for ins in md.disasm(data[off:off + 0x140], call_site):
-        imm = _imm_call(ins)
-        if imm is None:
+    def _captures_eax(ins):
+        """True for `mov <reg|mem>, eax` (storing a call's return value)."""
+        if ins.mnemonic != "mov" or len(ins.operands) != 2:
+            return False
+        src = ins.operands[1]
+        return src.type == X86_OP_REG and ins.reg_name(src.reg) == "eax"
+
+    insns = list(md.disasm(data, text_va))
+    # Anchor on the CRT startup: __getmainargs is called only there (fall back to
+    # the first exit-family call). GCC block-reordering means `call main` may sit
+    # before OR after the anchor in address order, so scan a symmetric window and
+    # pick the main-shaped call NEAREST the anchor.
+    gidx = [i for i, ins in enumerate(insns) if _imm_call(ins) in gma_addrs]
+    if gidx:
+        center = gidx[0]
+    else:
+        eidx = [i for i, ins in enumerate(insns) if _imm_call(ins) in exit_addrs]
+        if not eidx:
+            return None
+        center = eidx[0]
+    lo, hi = max(1, center - 160), min(len(insns), center + 160)
+
+    strong, weak = [], []          # (distance-to-anchor, target)
+    for i in range(lo, hi):
+        tgt = _imm_call(insns[i])
+        if tgt is None or not (text_lo <= tgt < text_hi) or tgt in thunk_addrs:
             continue
-        if imm in exit_thunks:
-            if last_user_call is not None:
-                return last_user_call
-        elif text_lo <= imm < text_hi and imm not in thunk_addrs:
-            last_user_call = imm
-    return last_user_call
+        eax_used = any(_captures_eax(insns[k])
+                       for k in range(i + 1, min(hi, i + 4)))
+        if not eax_used:
+            continue
+        # main(argc, argv, ...): the argc arg is written to [esp] in the very
+        # instruction before the call — a tight, main-specific signature.
+        if _writes_esp0(insns[i - 1]):
+            strong.append((abs(i - center), tgt))
+        elif any(_writes_esp0(insns[k]) for k in range(max(lo, i - 4), i)):
+            weak.append((abs(i - center), tgt))
+    if strong:
+        return min(strong)[1]
+    if weak:
+        return min(weak)[1]
+    return None
 
 
 def detect_main(exe_path, image_base, is_64=False):
@@ -372,6 +411,10 @@ def name_thunks(exe_path, image_base, is_64=False):
         pe = pefile.PE(exe_path, fast_load=True)
         pe.parse_data_directories(directories=[
             pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+        # Match everything in FILE (preferred-ImageBase) space — the .text bytes
+        # and the IAT VAs from pefile are both pre-relocation — then rebase the
+        # resulting thunk addresses to the runtime image base. Getting this wrong
+        # silently yields zero thunks on ASLR/dynamic-base images (delta != 0).
         base = int(pe.OPTIONAL_HEADER.ImageBase)
         delta = int(image_base) - base
         iat = {}
@@ -379,7 +422,7 @@ def name_thunks(exe_path, image_base, is_64=False):
             for dll in pe.DIRECTORY_ENTRY_IMPORT:
                 for imp in dll.imports:
                     if imp.address:
-                        va = int(imp.address) + delta
+                        va = int(imp.address)          # file space (no rebase)
                         if imp.name:
                             iat[va] = imp.name.decode("utf-8", "replace")
                         elif imp.ordinal is not None:
@@ -391,7 +434,7 @@ def name_thunks(exe_path, image_base, is_64=False):
         if section is None:
             return {}
         data = section.get_data()
-        text_va = int(image_base) + int(section.VirtualAddress)
+        file_text_va = base + int(section.VirtualAddress)   # file space
         ptr_w = 8 if is_64 else 4
         result = {}
         for m in re.finditer(b"\xff\x25", data):
@@ -400,16 +443,17 @@ def name_thunks(exe_path, image_base, is_64=False):
             if len(raw) < ptr_w:
                 continue
             ptr = int.from_bytes(raw, "little")
+            thunk_run_va = file_text_va + off + delta        # rebased result
             if not is_64 and ptr in iat:
-                result[text_va + off] = iat[ptr]
+                result[thunk_run_va] = iat[ptr]
             elif is_64:
                 # x64 uses rip-relative: [rip + disp]; target = next_ip + disp
                 disp = int.from_bytes(raw, "little")
                 if disp & 0x80000000:
                     disp -= 0x100000000
-                tgt = (text_va + off + 6) + disp
+                tgt = (file_text_va + off + 6) + disp        # file space
                 if tgt in iat:
-                    result[text_va + off] = iat[tgt]
+                    result[thunk_run_va] = iat[tgt]
         return result
     except Exception:
         return {}
