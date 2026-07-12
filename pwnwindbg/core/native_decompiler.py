@@ -1,0 +1,483 @@
+"""Fast NATIVE (no-LLM) x86 pseudo-C decompiler.
+
+Runs instantly (pure capstone, no network) so the live context can show it on
+every `si`/`ni`. Recovers stack variables, lifts each instruction to a readable
+pseudo-C statement with register copy-propagation, annotates calls with their
+resolved name + arguments, and — the differentiator over a static tool — shows
+the RUNTIME values of the current call's arguments (from live regs/stack).
+
+Control flow is emitted as labels + `if (cond) goto Lxxxx;` (correct and
+readable); the on-demand LLM decompiler (`dc ai`) does full if/while/for
+structuring. Result shape matches display/decompile_view.py:
+    {"start","end","code","lines","addr_map":[(addr,line_idx)]}
+"""
+
+import hashlib
+
+try:
+    from capstone import Cs, CS_ARCH_X86, CS_MODE_32, CS_MODE_64
+    from capstone.x86 import X86_OP_REG, X86_OP_IMM, X86_OP_MEM
+    _CAPSTONE = True
+except Exception:  # pragma: no cover
+    _CAPSTONE = False
+
+from .memory import read_memory_safe
+
+# structural cache: (start, sha1(bytes)) -> result dict (WITHOUT the live
+# current-call annotation, which is re-applied per render).
+_CACHE = {}
+
+_CC_JCC = {
+    "je": "==", "jz": "==", "jne": "!=", "jnz": "!=",
+    "jl": "<", "jnge": "<", "jle": "<=", "jng": "<=",
+    "jg": ">", "jnle": ">", "jge": ">=", "jnl": ">=",
+    "jb": "<", "jnae": "<", "jc": "<", "jbe": "<=", "jna": "<=",
+    "ja": ">", "jnbe": ">", "jae": ">=", "jnb": ">=", "jnc": ">=",
+    "js": "< 0", "jns": ">= 0",
+}
+
+
+def _regs(debugger):
+    r = debugger.get_registers()
+    if isinstance(r, tuple):
+        r = r[0]
+    return r or {}
+
+
+def _ip(debugger, regs):
+    return regs.get("Eip") if debugger.is_wow64 else regs.get("Rip")
+
+
+def _bounds(debugger, addr):
+    try:
+        from .decompiler import get_function_bounds
+        return get_function_bounds(debugger, addr)
+    except Exception:
+        return (addr, addr + 0x200)
+
+
+# --- operand / expression formatting --------------------------------------
+
+class _Ctx:
+    """Per-function lifting context."""
+    def __init__(self, debugger, is64):
+        self.debugger = debugger
+        self.is64 = is64
+        self.regexpr = {}      # reg name -> current expression string
+        self.pushes = []       # pending pushed arg expressions (for the next call)
+        self.decls = {}        # var name -> (decl string) for the header
+        self.arrays = set()     # var names used with an index -> arrays
+
+
+def _reg_name(insn, op):
+    try:
+        return insn.reg_name(op.reg)
+    except Exception:
+        return "reg"
+
+
+def _fmt_imm(v):
+    v &= 0xFFFFFFFFFFFFFFFF
+    if v > 0x7FFFFFFF and v <= 0xFFFFFFFF:
+        # show small negatives nicely
+        sv = v - 0x100000000
+        if -16 <= sv < 0:
+            return str(sv)
+    if v < 10:
+        return str(v)
+    return hex(v)
+
+
+def _var_for_mem(ctx, insn, op):
+    """Return a variable/deref expression for a memory operand, and register it."""
+    m = op.mem
+    base = insn.reg_name(m.base) if m.base != 0 else None
+    index = insn.reg_name(m.index) if m.index != 0 else None
+    disp = m.disp
+    # ebp/rbp frame locals & args
+    bp = "ebp" if not ctx.is64 else "rbp"
+    sp = "esp" if not ctx.is64 else "rsp"
+    if base == bp and index is None:
+        if disp < 0:
+            name = "v_%x" % (-disp)
+            ctx.decls.setdefault(name, None)
+            return name
+        elif disp >= (8 if not ctx.is64 else 16):
+            k = (disp - (8 if not ctx.is64 else 16)) // (4 if not ctx.is64 else 8) + 1
+            return "a%d" % k
+        else:
+            return "*(saved_%x)" % disp
+    if base == bp and index is not None:
+        # array access v_N[index]
+        name = "v_%x" % (-disp) if disp < 0 else "v_%x" % disp
+        ctx.arrays.add(name)
+        ctx.decls.setdefault(name, None)
+        idx = ctx.regexpr.get(index, index)
+        return "%s[%s]" % (name, idx)
+    # generic [reg + disp]
+    b = ctx.regexpr.get(base, base) if base else None
+    parts = []
+    if b:
+        parts.append(b)
+    if index:
+        ix = ctx.regexpr.get(index, index)
+        parts.append(ix if m.scale == 1 else "%s*%d" % (ix, m.scale))
+    if disp:
+        parts.append(_fmt_imm(disp & 0xFFFFFFFF))
+    inner = " + ".join(parts) if parts else "0"
+    return "*(%s)" % inner
+
+
+def _opnd(ctx, insn, op):
+    """Format one operand as a C expression (with copy-propagation)."""
+    if op.type == X86_OP_REG:
+        r = _reg_name(insn, op)
+        return ctx.regexpr.get(r, r)
+    if op.type == X86_OP_IMM:
+        return _fmt_imm(op.imm)
+    if op.type == X86_OP_MEM:
+        return _var_for_mem(ctx, insn, op)
+    return "?"
+
+
+def _dest_reg(insn, op):
+    if op.type == X86_OP_REG:
+        return _reg_name(insn, op)
+    return None
+
+
+def _mem_addr(ctx, insn, op):
+    """Address expression of a memory operand (for lea)."""
+    expr = _var_for_mem(ctx, insn, op)
+    if expr.startswith("*("):
+        return expr[2:-1]          # *(X) -> X
+    if expr.startswith("*"):
+        return expr[1:]
+    return "&" + expr              # &v_14 / &a1
+
+
+_CALLER_SAVED = ("eax", "ecx", "edx", "rax", "rcx", "rdx", "r8", "r9",
+                 "r10", "r11")
+
+
+def _target_imm(insn):
+    for op in insn.operands:
+        if op.type == X86_OP_IMM:
+            return op.imm
+    return None
+
+
+def _lift(ctx, insn, labels, cur_ip):
+    """Return a list of C-statement strings for one instruction (no addr tag)."""
+    m = insn.mnemonic
+    ops = insn.operands
+    try:
+        if m in ("nop", "int3", "endbr32", "endbr64", "hlt", "fnop"):
+            return []
+        if m in ("push",):
+            if ops:
+                d = _dest_reg(insn, ops[0])
+                if d in ("ebp", "esp", "rbp", "rsp"):
+                    return []      # frame save, not a call argument
+                ctx.pushes.append(_opnd(ctx, insn, ops[0]))
+            return []
+        if m in ("pop",):
+            if ops:
+                d = _dest_reg(insn, ops[0])
+                if d:
+                    ctx.regexpr.pop(d, None)
+            return []
+        if m in ("mov", "movzx", "movsx", "movsxd", "movaps", "movdqu", "movd", "movq"):
+            if len(ops) == 2:
+                d = _dest_reg(insn, ops[0])
+                if d in ("ebp", "rbp"):
+                    return []      # `mov ebp, esp` frame setup
+                src = _opnd(ctx, insn, ops[1])
+                if d:
+                    ctx.regexpr[d] = src
+                    return []          # folded into the register; no statement
+                dst = _opnd(ctx, insn, ops[0])
+                return ["%s = %s;" % (dst, src)]
+        if m == "lea" and len(ops) == 2:
+            addr = _mem_addr(ctx, insn, ops[1])
+            d = _dest_reg(insn, ops[0])
+            if d:
+                ctx.regexpr[d] = addr
+                return []
+        if m in ("add", "sub", "and", "or", "xor", "shl", "shr", "sar",
+                 "imul", "mul", "sal"):
+            cop = {"add": "+", "sub": "-", "and": "&", "or": "|", "xor": "^",
+                   "shl": "<<", "shr": ">>", "sar": ">>", "sal": "<<",
+                   "imul": "*", "mul": "*"}[m]
+            if len(ops) >= 2:
+                d = _dest_reg(insn, ops[0])
+                if d in ("esp", "rsp"):
+                    return []      # hide stack-pointer cleanup (add/sub esp, N)
+                dst = _opnd(ctx, insn, ops[0])
+                src = _opnd(ctx, insn, ops[1])
+                if m == "xor" and d and src == dst:
+                    if d:
+                        ctx.regexpr[d] = "0"
+                    return []
+                if d:
+                    ctx.regexpr[d] = d      # stop folding after arithmetic
+                return ["%s %s= %s;" % (dst, cop, src)]
+        if m in ("inc", "dec") and ops:
+            dst = _opnd(ctx, insn, ops[0])
+            d = _dest_reg(insn, ops[0])
+            if d:
+                ctx.regexpr[d] = d
+            return ["%s%s;" % (dst, "++" if m == "inc" else "--")]
+        if m in ("neg", "not") and ops:
+            dst = _opnd(ctx, insn, ops[0])
+            return ["%s = %s%s;" % (dst, "-" if m == "neg" else "~", dst)]
+        if m in ("cmp", "test") and len(ops) == 2:
+            a = _opnd(ctx, insn, ops[0])
+            b = _opnd(ctx, insn, ops[1])
+            ctx.pending = ("test", a, b) if m == "test" else ("cmp", a, b)
+            return []
+        if m == "call":
+            return _lift_call(ctx, insn, cur_ip)
+        if m in _CC_JCC:
+            tgt = _target_imm(insn)
+            cond = _cond_expr(ctx, m)
+            lbl = "L_%x" % tgt if tgt in labels else (hex(tgt) if tgt else "?")
+            ctx.regexpr.clear()
+            return ["if (%s) goto %s;" % (cond, lbl)]
+        if m in ("jmp",):
+            tgt = _target_imm(insn)
+            ctx.regexpr.clear()
+            if tgt in labels:
+                return ["goto L_%x;" % tgt]
+            if tgt is not None:
+                return ["goto %s;  /* tailcall */" % _callee_name(ctx, tgt)]
+            return ["goto *(%s);" % _opnd(ctx, insn, ops[0])]
+        if m in ("ret", "retn"):
+            eax = ctx.regexpr.get("eax") or ctx.regexpr.get("rax")
+            return ["return %s;" % eax] if eax else ["return;"]
+        if m in ("leave",):
+            return []
+        if m in ("loop", "loope", "loopne"):
+            tgt = _target_imm(insn)
+            return ["if (--ecx) goto L_%x;" % tgt] if tgt in labels else []
+    except Exception:
+        pass
+    # Fallback: keep the raw asm so nothing is silently lost.
+    return ["/* %s %s */" % (insn.mnemonic, insn.op_str)]
+
+
+def _cond_expr(ctx, jcc):
+    op = _CC_JCC.get(jcc, "!=")
+    pend = getattr(ctx, "pending", None)
+    if not pend:
+        return "cond"
+    kind, a, b = pend
+    if kind == "test":
+        if a == b:
+            return "%s %s" % (a, op) if op.endswith("0") else "%s %s 0" % (a, op)
+        return "(%s & %s) %s 0" % (a, b, op if op.endswith("0") is False else op)
+    # cmp a, b
+    if op.endswith("0"):
+        return "%s %s" % (a, op)
+    return "%s %s %s" % (a, op, b)
+
+
+def _callee_name(ctx, tgt):
+    try:
+        n = ctx.debugger.symbols.resolve_address(tgt)
+        if n:
+            # strip module! prefix for readability
+            return n.split("!", 1)[1] if "!" in n else n
+    except Exception:
+        pass
+    return "sub_%X" % tgt
+
+
+def _lift_call(ctx, insn, cur_ip):
+    ops = insn.operands
+    # resolve target name
+    name = None
+    tgt = None
+    if ops and ops[0].type == X86_OP_IMM:
+        tgt = ops[0].imm
+        name = _callee_name(ctx, tgt)
+    elif ops:
+        name = "(%s)" % _opnd(ctx, insn, ops[0])
+    else:
+        name = "??"
+    # cdecl: C args = pushes in reverse (last push = first arg is FALSE; first
+    # pushed is the LAST arg). We pushed in program order, so C order = reversed.
+    args = list(reversed(ctx.pushes))
+    ctx.pushes = []
+    call_expr = "%s(%s)" % (name, ", ".join(args))
+    # live runtime values for the CURRENT call
+    live = ""
+    if cur_ip is not None and insn.address == cur_ip:
+        live = _live_args(ctx, name)
+    # result flows into eax; clear caller-saved
+    for r in _CALLER_SAVED:
+        ctx.regexpr.pop(r, None)
+    ctx.regexpr["eax"] = call_expr
+    ctx.regexpr["rax"] = call_expr
+    stmt = call_expr + ";"
+    if live:
+        stmt += "  // " + live
+    return [stmt]
+
+
+def _live_args(ctx, name):
+    """Runtime values of the current call's args (the debugger differentiator)."""
+    try:
+        from .call_args import resolve_call_args
+        proto = None
+        try:
+            from .api_protos import lookup
+            base = name.split("(")[0]
+            proto = lookup(base)
+        except Exception:
+            proto = None
+        regs = _regs(ctx.debugger)
+        arglist = resolve_call_args(ctx.debugger, regs, num_args=4, proto=proto)
+        parts = []
+        for a in arglist[:6]:
+            try:
+                nm, val, ann = a
+            except Exception:
+                continue
+            if ann:
+                parts.append("%s=%#x %s" % (nm, val & 0xFFFFFFFFFFFFFFFF, ann))
+            else:
+                parts.append("%s=%#x" % (nm, val & 0xFFFFFFFFFFFFFFFF))
+        return "args: " + ", ".join(parts) if parts else ""
+    except Exception:
+        return ""
+
+
+def decompile_native(debugger, addr, max_insns=400):
+    """Fast native pseudo-C for the function containing `addr`. Never raises."""
+    if not _CAPSTONE:
+        return None
+    try:
+        start, end = _bounds(debugger, addr)
+        if not start or end <= start:
+            return None
+        size = min(end - start, 0x2000)
+        code = read_memory_safe(getattr(debugger, "process_handle", None), start, size)
+        if not code:
+            return None
+
+        regs = _regs(debugger)
+        cur_ip = _ip(debugger, regs)
+        is64 = not debugger.is_wow64
+        md = Cs(CS_ARCH_X86, CS_MODE_64 if is64 else CS_MODE_32)
+        md.detail = True
+        insns = list(md.disasm(code, start))[:max_insns]
+        if not insns:
+            return None
+
+        # branch-target labels
+        labels = set()
+        for ins in insns:
+            mn = ins.mnemonic
+            if mn in _CC_JCC or mn in ("jmp", "loop", "loope", "loopne"):
+                t = _target_imm(ins)
+                if t is not None and start <= t < end:
+                    labels.add(t)
+
+        # cache key on the structural part
+        key = (start, hashlib.sha1(code[:end - start]).hexdigest()[:16])
+        cached = _CACHE.get(key)
+
+        name = _callee_name_for_start(debugger, start)
+        if cached is None:
+            ctx = _Ctx(debugger, is64)
+            # skip standard prologue for readability
+            body = []           # (addr, text)
+            addr_map = []
+            for ins in insns:
+                # emit label
+                if ins.address in labels:
+                    body.append((ins.address, "L_%x:" % ins.address))
+                stmts = _lift(ctx, ins, labels, None)  # structural pass: no live
+                for s in stmts:
+                    body.append((ins.address, "    " + s))
+            # header
+            decls = []
+            for v in sorted(ctx.decls):
+                if v in ctx.arrays:
+                    decls.append("    char %s[/*?*/];" % v)
+                else:
+                    decls.append("    int %s;" % v)
+            header = ["%s()" % name, "{"] + decls + ([""] if decls else [])
+            # Build code with addr annotations line-by-line.
+            out_lines = []
+            amap = []
+            for h in header:
+                out_lines.append(h)
+            for a, t in body:
+                if t.endswith(":"):
+                    out_lines.append(t)
+                else:
+                    amap.append((a, len(out_lines)))
+                    out_lines.append("%s // @0x%x" % (t, a))
+            out_lines.append("}")
+            result = {
+                "start": start, "end": end,
+                "code": "\n".join(out_lines),
+                "lines": out_lines,
+                "addr_map": amap,
+            }
+            _CACHE[key] = result
+            cached = result
+
+        # Re-apply the CURRENT-call live annotation fresh (not cached), by
+        # recomputing just for the current ip's call line.
+        result = _with_live(debugger, cached, cur_ip, is64)
+        return result
+    except Exception:
+        return None
+
+
+def _callee_name_for_start(debugger, start):
+    try:
+        n = debugger.symbols.resolve_address(start)
+        if n and "!" in n:
+            nm = n.split("!", 1)[1]
+            if "+" not in nm:
+                return nm
+    except Exception:
+        pass
+    return "sub_%X" % start
+
+
+def _with_live(debugger, cached, cur_ip, is64):
+    """Return a copy of `cached` with a live arg comment on the current line."""
+    if cur_ip is None:
+        return cached
+    try:
+        line_idx = None
+        for a, idx in cached.get("addr_map", []):
+            if a == cur_ip:
+                line_idx = idx
+                break
+        if line_idx is None:
+            return cached
+        lines = list(cached["lines"])
+        ln = lines[line_idx]
+        if "// live:" in ln:
+            return cached
+        # only annotate call lines
+        if "(" in ln and ")" in ln:
+            # recompute live args using a throwaway ctx
+            ctx = _Ctx(debugger, is64)
+            # name = text before '('
+            base = ln.strip().split("(")[0]
+            live = _live_args(ctx, base)
+            if live:
+                lines[line_idx] = ln + "   // live: " + live
+        new = dict(cached)
+        new["lines"] = lines
+        new["code"] = "\n".join(lines)
+        return new
+    except Exception:
+        return cached

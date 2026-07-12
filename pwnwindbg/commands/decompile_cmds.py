@@ -13,8 +13,9 @@ A decompiler failure never crashes the REPL — everything is caught and reporte
 """
 
 from ..core.decompiler import decompile_function
+from ..core.native_decompiler import decompile_native
 from ..display.decompile_view import display_decompile
-from ..display.common import error, success
+from ..display.common import error, success, info
 from ..utils.addr_expr import eval_expr
 
 
@@ -57,6 +58,12 @@ def cmd_decompile(debugger, args):
             success("decompile: auto-context pane OFF")
             return None
 
+        # `dc ai [addr]` -> the slower, prettier LLM decompiler (on demand).
+        use_ai = False
+        if low == "ai" or low.startswith("ai "):
+            use_ai = True
+            arg = arg[2:].strip()
+
         # Resolve the target address.
         if arg:
             addr = eval_expr(debugger, arg)
@@ -67,13 +74,17 @@ def cmd_decompile(debugger, args):
             addr = _current_ip(debugger)
             if addr is None:
                 error(
-                    "Usage: decompile [<addr|symbol>] (default = current IP); "
-                    "decompile on|off"
+                    "Usage: decompile [ai] [<addr|symbol>] (default = current "
+                    "IP); decompile on|off"
                 )
                 return None
 
-        # force=True so on-demand decompiling works even in library code.
-        result = decompile_function(debugger, addr, force=True)
+        if use_ai:
+            info("decompile(ai): asking the LLM (slower)…")
+            result = decompile_function(debugger, addr, force=True)
+        else:
+            # Native, instant decompiler (no LLM).
+            result = decompile_native(debugger, addr)
         if not result:
             error("decompile failed or unavailable")
             return None

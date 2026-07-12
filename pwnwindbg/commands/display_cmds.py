@@ -327,8 +327,13 @@ def _maybe_decompile(debugger, regs, current_ip):
             debugger.show_decompile = show
         if not show or not current_ip:
             return None
-        from ..core.decompiler import decompile_function
-        return decompile_function(debugger, current_ip)
+        # Only the target's own code, and use the FAST native decompiler (no
+        # LLM) so stepping stays instant. `dc ai` gives the LLM version.
+        from ..core.decompiler import is_user_code
+        if not is_user_code(debugger, current_ip):
+            return None
+        from ..core.native_decompiler import decompile_native
+        return decompile_native(debugger, current_ip)
     except Exception:
         return None
 
