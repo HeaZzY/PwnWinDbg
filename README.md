@@ -6,7 +6,8 @@
 # pwnWinDbg
 
 
-<img width="1580" height="948" alt="image" src="https://github.com/user-attachments/assets/a1e217c5-747b-4596-a174-b5674c1a1e73" />
+<img width="1882" height="936" alt="image" src="https://github.com/user-attachments/assets/104858fc-b9c0-4b37-bfba-c8655966f91d" />
+
 
 
 **A pwndbg-style debugger for Windows userland**, built from scratch on the Windows Debug API.
