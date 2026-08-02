@@ -8,9 +8,12 @@ from .execution import (
 from .examine import parse_x_command
 from .info_cmds import (
     cmd_info, cmd_checksec, cmd_iat, cmd_vmmap, cmd_modules, cmd_functions,
+    cmd_analyze_funcs, cmd_winfunc,
 )
 from .memory_cmds import cmd_stack, cmd_telescope, cmd_p2p
 from .display_cmds import cmd_regs, cmd_disasm, display_context
+from .decompile_cmds import cmd_decompile
+from .angr_cmds import cmd_angr
 from .cyclic_cmds import cmd_cyclic
 from .search_cmds import cmd_search
 from .patch_cmds import cmd_patch, cmd_set, cmd_write, cmd_dump
@@ -67,6 +70,7 @@ from .kd_dt_cmds import cmd_kddt
 from .kd_callback_cmds import cmd_kdcallbacks
 from .kd_ssdt_cmds import cmd_kdssdt
 from .kd_vad_cmds import cmd_kdvad
+from .ai_cmds import cmd_ai
 from ..display.formatters import error, info, console
 
 
@@ -131,6 +135,10 @@ COMMANDS = {
     "ctx":          (lambda d, a: (display_context(d), None)[1], "Alias for context"),
     "hexdump":      (cmd_hexdump,   "Hex + ASCII dump: hexdump <addr> [size]"),
     "hd":           (cmd_hexdump,   "Alias for hexdump"),
+    "decompile":    (cmd_decompile, "Native pseudo-C of the function (instant); `dc ai` for the LLM version; `decompile on/off`"),
+    "dc":           (cmd_decompile, "Alias for decompile (native, instant; `dc ai` = LLM)"),
+    "pdc":          (cmd_decompile, "Alias for decompile"),
+    "angr":         (cmd_angr,      "Symbolic-exec payload solver: angr <target> [from A][avoid A,B][send]"),
 
     # Memory
     "stack":        (cmd_stack,     "Show stack: stack [count]"),
@@ -170,6 +178,11 @@ COMMANDS = {
     "modules":      (cmd_modules,   "List loaded modules"),
     "functions":    (cmd_functions, "List functions: functions [filter]"),
     "funcs":        (cmd_functions, "Alias for functions"),
+    "winfunc":      (cmd_winfunc,   "List win targets (functions calling system/WinExec/exec)"),
+    "wins":         (cmd_winfunc,   "Alias for winfunc"),
+    "sinks":        (cmd_winfunc,   "Alias for winfunc"),
+    "analyze-functions": (cmd_analyze_funcs, "Discover functions in the main image (stripped-binary analysis)"),
+    "afl":          (cmd_analyze_funcs, "Alias for analyze-functions (analyze function list)"),
 
     # PEB / TEB
     "peb":          (cmd_peb,       "Show PEB: peb [-v|modules|env|params]"),
@@ -276,6 +289,9 @@ COMMANDS = {
     "kdcallbacks":  (cmd_kdcallbacks,   "Enumerate Psp{Process,Thread,Image}Notify callback arrays"),
     "kdssdt":       (cmd_kdssdt,        "Dump KeServiceDescriptorTable: kdssdt [count] [-h]"),
     "kdvad":        (cmd_kdvad,         "Walk a process VAD tree: kdvad <pid|name> [-x|-w]"),
+
+    # AI agent
+    "ai":           (cmd_ai,        'AI agent: ai "<task>" | ai config|use|model|key|status'),
 }
 
 
@@ -414,6 +430,7 @@ _USERLAND_HELP = {
         ("context / ctx",         "Full pwndbg-style context (regs+disasm+stack+bt)"),
         ("regs",                  "Show registers (highlights changes)"),
         ("disasm / u [addr] [n]", "Disassemble N instructions"),
+        ("decompile / dc [addr]", "AI pseudo-C of the function (native, cached; `decompile on/off`)"),
         ("hexdump / hd <addr>",   "Hex + ASCII dump"),
         ("stack [count]",         "Telescope-style stack view"),
         ("tel [addr] [depth]",    "Recursive pointer dereference (telescope)"),
@@ -440,6 +457,12 @@ _USERLAND_HELP = {
         ("p2p <addr>",            "Deep pointer chain"),
         ("xinfo <addr>",          "Detailed address info (region/module/perms)"),
         ("distance <a> <b>",      "Offset between two addresses"),
+    ],
+    "AI agent": [
+        ('ai "<task>"',           "Autonomous AI drives the debugger to solve a task"),
+        ("ai use <provider>",     "Pick backend: claude_code | openai | anthropic"),
+        ("ai config / status",    "Show/set config (key, model, path)"),
+        ("run -i <exe>",          "Spawn with an I/O tube so the AI can send/recv"),
     ],
     "Heap analysis": [
         ("heap",                  "List all process heaps (CRT, NT, LFH, Segment)"),

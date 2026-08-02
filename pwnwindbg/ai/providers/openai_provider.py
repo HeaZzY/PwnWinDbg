@@ -1,0 +1,222 @@
+"""OpenAI-compatible ``/chat/completions`` provider (streaming SSE).
+
+Works with any OpenAI-compatible endpoint: Kimi/Moonshot, DeepSeek, OpenRouter,
+local servers, etc.  HTTP is done with the standard library (:mod:`urllib`); no
+``requests``/``httpx`` dependency.
+"""
+
+import json
+import urllib.request
+import urllib.error
+from typing import Iterator
+
+from .base import AgentSession, _effective_key
+
+
+class OpenAISession(AgentSession):
+    """Chat session against an OpenAI-compatible ``/chat/completions`` endpoint.
+
+    Subclass and override :attr:`provider_name` / :attr:`default_base` /
+    :attr:`default_model` to point at another OpenAI-compatible backend (GLM,
+    DeepSeek, …) while reusing all of the SSE streaming machinery below.
+    """
+
+    #: config section name AND the key used for API-key resolution
+    provider_name = "openai"
+    default_base = "https://api.openai.com/v1"
+    default_model = "gpt-4o-mini"
+
+    def __init__(self, cfg: dict, system_prompt: str):
+        super().__init__(cfg, system_prompt)
+        self._section = (cfg or {}).get(self.provider_name) or {}
+
+    def _endpoint(self) -> str:
+        base = (self._section.get("base_url") or self.default_base).rstrip("/")
+        return base + "/chat/completions"
+
+    def _build_messages(self):
+        msgs = []
+        if self.system_prompt:
+            msgs.append({"role": "system", "content": self.system_prompt})
+        msgs.extend(self._trimmed_history())
+        return msgs
+
+    def _trimmed_history(self):
+        """Resend the whole history, or (for long runs) the initial task turn
+        plus the most recent ``max_history_turns`` turns, so latency/cost don't
+        grow without bound. ``max_history_turns`` <= 0 disables trimming."""
+        turns = int(self.cfg.get("max_history_turns", 0) or 0)
+        if turns <= 0 or len(self.messages) <= turns + 1:
+            return self.messages
+        # keep the first message (the task) + the last `turns` messages
+        return [self.messages[0]] + self.messages[-turns:]
+
+    def send(self, user_text: str) -> Iterator[str]:
+        self.messages.append({"role": "user", "content": user_text})
+
+        key = _effective_key(self.cfg, self.provider_name)
+        if not key:
+            raise RuntimeError(
+                f"{self.provider_name} error: no API key. Set it with "
+                f"'ai key {self.provider_name} <value>' or export the "
+                "configured api_key_env."
+            )
+
+        model = self._section.get("model") or self.default_model
+        body = {
+            "model": model,
+            "messages": self._build_messages(),
+            "temperature": self.cfg.get("temperature", 0.2),
+            "max_tokens": self._section.get("max_tokens", 4096),
+            "stream": True,
+        }
+        # Anti-repetition penalties curb the model degenerating into a token
+        # loop ("3e3e3e…"). Only sent when non-zero so strict endpoints don't 400.
+        fp = self._section.get("frequency_penalty",
+                               self.cfg.get("frequency_penalty", 0.4))
+        pp = self._section.get("presence_penalty",
+                               self.cfg.get("presence_penalty", 0))
+        if fp:
+            body["frequency_penalty"] = fp
+        if pp:
+            body["presence_penalty"] = pp
+        data = json.dumps(body).encode("utf-8")
+
+        req = urllib.request.Request(
+            self._endpoint(),
+            data=data,
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + key,
+                "Accept": "text/event-stream",
+            },
+        )
+
+        assistant_parts = []
+        tag = self.provider_name
+        try:
+            resp = urllib.request.urlopen(req, timeout=600)
+        except urllib.error.HTTPError as e:
+            detail = _read_error_body(e)
+            raise RuntimeError(f"{tag} error: HTTP {e.code} {e.reason}: {detail}") from e
+        except urllib.error.URLError as e:
+            raise RuntimeError(f"{tag} error: connection failed: {e.reason}") from e
+        except Exception as e:  # noqa: BLE001 - surface anything as RuntimeError
+            raise RuntimeError(f"{tag} error: {e}") from e
+
+        max_chars = int(self._section.get(
+            "max_reply_chars", self.cfg.get("max_reply_chars", 16000)) or 16000)
+        degenerate = False
+        try:
+            total = 0
+            since_check = 0
+            for delta in _iter_sse_deltas(resp):
+                assistant_parts.append(delta)
+                total += len(delta)
+                since_check += len(delta)
+                yield delta
+                # Stop a runaway: hard char cap, or a repetitive tail.
+                if total >= max_chars:
+                    degenerate = True
+                    break
+                if since_check >= 200:
+                    since_check = 0
+                    if _is_degenerate_tail("".join(assistant_parts)):
+                        degenerate = True
+                        break
+        except RuntimeError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"{tag} error: stream read failed: {e}") from e
+        finally:
+            try:
+                resp.close()
+            except Exception:
+                pass
+
+        full = "".join(assistant_parts)
+        if degenerate:
+            # Keep the useful prefix (it may hold a valid action block); drop the
+            # repetitive tail so it doesn't poison the conversation history.
+            full = _clean_degenerate(full)
+            yield "\n[note: reply truncated — it started repeating]\n"
+        self.messages.append({"role": "assistant", "content": full})
+
+
+def _is_degenerate_tail(text: str) -> bool:
+    """True if the end of ``text`` looks like runaway repetition.
+
+    Catches two failure modes: near-zero character diversity in the tail
+    (``3e3e3e…``), and a short unit tiling the last stretch of output.
+    """
+    if len(text) < 400:
+        return False
+    tail = text[-240:]
+    if len(set(tail)) <= 5:
+        return True
+    for p in range(1, 25):
+        seg = tail[-max(80, p * 10):]
+        unit = seg[-p:]
+        k = len(seg) // p
+        if k >= 6 and seg[-k * p:] == unit * k:
+            return True
+    return False
+
+
+def _clean_degenerate(text: str) -> str:
+    """Strip a runaway repetitive tail, keeping the useful prefix."""
+    for p in range(1, 25):
+        unit = text[-p:]
+        if unit and text.endswith(unit * 4):
+            while len(text) > p and text.endswith(unit * 2):
+                text = text[:-p]
+            break
+    return text.rstrip()
+
+
+def _iter_sse_deltas(resp) -> Iterator[str]:
+    """Yield ``choices[0].delta.content`` text deltas from an SSE stream.
+
+    Iterating the response yields raw bytes lines; we decode, strip the
+    ``data: `` prefix, stop on ``[DONE]`` and json-decode the rest.
+    """
+    for raw in resp:
+        line = raw.decode("utf-8", "replace").strip()
+        if not line or not line.startswith("data:"):
+            continue
+        payload = line[len("data:"):].strip()
+        if payload == "[DONE]":
+            break
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        choices = obj.get("choices") or []
+        if not choices:
+            continue
+        delta = choices[0].get("delta") or {}
+        content = delta.get("content")
+        if content:
+            yield content
+
+
+def _read_error_body(err) -> str:
+    """Extract a short human-readable message from an HTTPError body."""
+    try:
+        raw = err.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+    try:
+        obj = json.loads(raw)
+        if isinstance(obj, dict):
+            e = obj.get("error")
+            if isinstance(e, dict) and e.get("message"):
+                return str(e["message"])
+            if isinstance(e, str):
+                return e
+            if obj.get("message"):
+                return str(obj["message"])
+    except json.JSONDecodeError:
+        pass
+    return raw[:500]

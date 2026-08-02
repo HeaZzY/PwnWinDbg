@@ -7,13 +7,25 @@ from ..display.formatters import error, info, success, warn, console
 
 
 def cmd_run(debugger, args):
-    """Spawn a process: run <exe> [args] [< stdin_file]
+    """Spawn a process: run [-i] <exe> [args] [< stdin_file]
 
     With no arguments, re-spawns the most recently launched executable
     using the same args and stdin redirection. To re-launch with new
     args without retyping the path, see `rerun`.
+
+    A leading `-i` / `--interactive` wires the child's stdin/stdout to a
+    pwntools-style tube (`debugger.tube`) so the AI agent and scripts can
+    send()/recv() to the debuggee. In interactive mode any `< stdin_file`
+    redirection is ignored (the tube owns stdin).
     """
     raw = args.strip()
+
+    # Leading `-i` / `--interactive` → spawn with I/O pipes (tube).
+    pipe_io = False
+    tokens = raw.split(None, 1)
+    if tokens and tokens[0].lower() in ("-i", "--interactive"):
+        pipe_io = True
+        raw = tokens[1].strip() if len(tokens) > 1 else ""
 
     # Parse stdin redirection: run exe args < file
     stdin_file = None
@@ -36,7 +48,7 @@ def cmd_run(debugger, args):
             if stdin_file is None:
                 stdin_file = debugger.exe_stdin_file
         else:
-            error("Usage: run <exe_path> [args] [< stdin_file]")
+            error("Usage: run [-i] <exe_path> [args] [< stdin_file]")
             return None
     else:
         # Use shlex with posix=False so Windows-style quoted paths
@@ -47,7 +59,7 @@ def cmd_run(debugger, args):
             error(f"Failed to parse command line: {e}")
             return None
         if not tokens:
-            error("Usage: run <exe_path> [args] [< stdin_file]")
+            error("Usage: run [-i] <exe_path> [args] [< stdin_file]")
             return None
         exe = tokens[0]
         # Strip surrounding quotes shlex left in place (posix=False keeps them).
@@ -59,7 +71,13 @@ def cmd_run(debugger, args):
         error(f"File not found: {exe}")
         return None
 
-    return _spawn_and_run(debugger, exe, extra_args, stdin_file)
+    # Resolve to an absolute path: CreateProcessW does not search the current
+    # directory for a bare relative name when NoDefaultCurrentDirectoryInExePath
+    # is in effect, so `run -i ch72.exe` would fail with err=2 even though the
+    # file exists in the cwd. abspath makes every form spawn reliably.
+    exe = os.path.abspath(exe)
+
+    return _spawn_and_run(debugger, exe, extra_args, stdin_file, pipe_io=pipe_io)
 
 
 def cmd_rerun(debugger, args):
@@ -95,11 +113,14 @@ def cmd_rerun(debugger, args):
     return _spawn_and_run(debugger, debugger.exe_path, new_args, stdin_file)
 
 
-def _spawn_and_run(debugger, exe, extra_args, stdin_file):
+def _spawn_and_run(debugger, exe, extra_args, stdin_file, pipe_io=False):
     """Shared spawn helper used by both `run` and `rerun`.
 
     If a previous process is still alive, terminate it first so we
     don't leak handles or end up debugging two children at once.
+
+    ``pipe_io`` requests an interactive I/O tube (see ``cmd_run``); it is
+    threaded straight through to ``debugger.spawn``.
     """
     from ..core.debugger import DebuggerState
     if debugger.state not in (DebuggerState.IDLE, DebuggerState.TERMINATED):
@@ -110,11 +131,13 @@ def _spawn_and_run(debugger, exe, extra_args, stdin_file):
             pass
 
     try:
-        debugger.spawn(exe, extra_args, stdin_file=stdin_file)
+        debugger.spawn(exe, extra_args, stdin_file=stdin_file, pipe_io=pipe_io)
         cmdline = exe + (f" {extra_args}" if extra_args else "")
         info(f"Spawned process PID={debugger.process_id} ({cmdline})")
         info(f"Architecture: {'x86 (WoW64)' if debugger.is_wow64 else 'x64'}")
-        if stdin_file:
+        if pipe_io:
+            info("Interactive I/O tube attached (send/recv available)")
+        elif stdin_file:
             info(f"Stdin: {stdin_file}")
 
         # Run until first stop

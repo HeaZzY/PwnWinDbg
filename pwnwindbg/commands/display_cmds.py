@@ -309,6 +309,35 @@ def _disasm_scan_until_ret(debugger, addr):
     return None
 
 
+def _maybe_decompile(debugger, regs, current_ip):
+    """Return the decompile result for ``current_ip`` (main-exe code) or None.
+
+    Honors the ``show_decompile`` toggle (lazy default from config). Fully
+    guarded — a decompiler/LLM problem must never break the context render.
+    Returns None for system-DLL code (decompile_function skips it in auto mode).
+    """
+    try:
+        show = getattr(debugger, "show_decompile", None)
+        if show is None:  # lazy default from config on first use
+            try:
+                from ..ai import config as _c
+                show = bool(_c.load().get("decompile_auto", True))
+            except Exception:
+                show = True
+            debugger.show_decompile = show
+        if not show or not current_ip:
+            return None
+        # Only the target's own code, and use the FAST native decompiler (no
+        # LLM) so stepping stays instant. `dc ai` gives the LLM version.
+        from ..core.decompiler import is_user_code
+        if not is_user_code(debugger, current_ip):
+            return None
+        from ..core.native_decompiler import decompile_native
+        return decompile_native(debugger, current_ip)
+    except Exception:
+        return None
+
+
 def display_context(debugger):
     """Display full context (registers + disasm + stack + backtrace) like pwndbg."""
     console.print()
@@ -342,8 +371,7 @@ def display_context(debugger):
                 break
             if a == current_ip:
                 break
-        display_disasm(
-            insns, current_ip,
+        d_kwargs = dict(
             symbol_resolver=debugger.symbols.resolve_address,
             count=12,
             ret_addr=ret_target,
@@ -351,6 +379,19 @@ def display_context(debugger):
             imm_resolver=imm_res,
             call_args=call_args,
         )
+        # When a decompile is available for the current function, show the
+        # disasm and the pseudo-C SIDE BY SIDE (IDA-style); else disasm alone.
+        dec_res = _maybe_decompile(debugger, regs, current_ip)
+        if dec_res is not None:
+            try:
+                with console.capture() as _cap:
+                    display_disasm(insns, current_ip, **d_kwargs)
+                from ..display.decompile_view import render_beside
+                render_beside(_cap.get(), dec_res, current_ip)
+            except Exception:
+                display_disasm(insns, current_ip, **d_kwargs)
+        else:
+            display_disasm(insns, current_ip, **d_kwargs)
 
     console.print()
 
@@ -371,5 +412,7 @@ def display_context(debugger):
             frames,
             symbol_resolver=debugger.symbols.resolve_address,
         )
+
+    # (The decompile pane is rendered inline beside the disasm in section 2.)
 
     separator()

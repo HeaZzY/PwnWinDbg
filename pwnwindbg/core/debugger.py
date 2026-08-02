@@ -34,6 +34,10 @@ from .watchpoints import WatchpointManager
 from .symbols import SymbolManager
 from .disasm import create_disassembler, disassemble_at
 
+# Not exported by utils.constants — defined here for the pipe-backed
+# (interactive) spawn path so the child runs without popping a console window.
+CREATE_NO_WINDOW = 0x08000000
+
 
 class DebuggerState:
     """Tracks current debugger state."""
@@ -54,11 +58,25 @@ class Debugger:
         self.main_thread_handle = None
         self.main_thread_id = None
         self.exe_path = None
+        # Interactive I/O tube (pwntools-style) to the debuggee's
+        # stdin/stdout, populated when spawning with pipe_io=True.
+        self.tube = None
+        # Optional wall-clock cap (seconds) for a single run_until_stop. None =
+        # wait forever (interactive default). The AI agent sets this so a
+        # `continue` on a debuggee that is blocked waiting for input returns
+        # control (as a "timeout" stop) instead of hanging the agent loop.
+        self.run_timeout = None
         # Last spawn arguments — saved so `run` (no args) and `rerun`
         # can re-launch the same target without retyping.
         self.exe_args = ""
         self.exe_stdin_file = None
         self.image_base = None
+        # Auto-decompile context pane toggle (tri-state):
+        #   None  -> not yet initialized (lazy default from ai config on first use)
+        #   True  -> show the pseudo-C pane in display_context
+        #   False -> hidden
+        # NOTE: do not import ai/config here — the default is resolved lazily.
+        self.show_decompile = None
 
         # Architecture
         self.is_wow64 = False  # True if debugging a 32-bit process on 64-bit OS
@@ -125,10 +143,24 @@ class Debugger:
         # key -> (original_requested_addr, next_addr)
         self._examine_next = {}
 
-    def spawn(self, exe_path, args="", stdin_file=None):
+    def spawn(self, exe_path, args="", stdin_file=None, pipe_io=False):
         """Spawn a new process under the debugger.
         stdin_file: path to a file to redirect as the process stdin.
+        pipe_io:    when True, wire the child's stdin/stdout/stderr to anonymous
+                    pipes and expose them as a pwntools-style ``self.tube`` so
+                    the AI agent (or scripts) can send()/recv() to the debuggee.
+                    In this mode the child has no console window and ``stdin_file``
+                    is ignored (the tube owns stdin).
         """
+        # Drop any stale tube from a previous run (e.g. the prior process
+        # exited on its own without going through terminate()/_cleanup()).
+        if self.tube is not None:
+            try:
+                self.tube.close()
+            except Exception:
+                pass
+            self.tube = None
+
         si = STARTUPINFOW()
         si.cb = sizeof(si)
         pi = PROCESS_INFORMATION()
@@ -142,8 +174,21 @@ class Debugger:
 
         inherit_handles = False
         stdin_handle = None
+        child_handles_to_close = None
 
-        if stdin_file:
+        if pipe_io:
+            # Interactive tube: build a STARTUPINFOW wired to fresh anonymous
+            # pipes; the parent-side ends live on the returned ProcTube. No
+            # console window for the child so its I/O only flows over the pipe.
+            from .proc_io import make_pipe_startupinfo
+            si, tube, child_handles_to_close = make_pipe_startupinfo()
+            si.cb = sizeof(si)
+            self.tube = tube
+            flags = (
+                DEBUG_PROCESS | DEBUG_ONLY_THIS_PROCESS | CREATE_NO_WINDOW
+            )
+            inherit_handles = True
+        elif stdin_file:
             # Open file as inheritable handle for child stdin
             import msvcrt
             GENERIC_READ = 0x80000000
@@ -196,7 +241,25 @@ class Debugger:
         if stdin_handle and stdin_handle != -1:
             kernel32.CloseHandle(stdin_handle)
 
+        # Close the child-side pipe ends now that the child inherited its own
+        # copies; if the parent kept the stdout-write end open, the tube's
+        # reader thread would never observe EOF.
+        if child_handles_to_close:
+            for h in child_handles_to_close:
+                try:
+                    kernel32.CloseHandle(h)
+                except Exception:
+                    pass
+
         if not ok:
+            if pipe_io and self.tube is not None:
+                # Spawn failed — tear down the half-built tube so we don't leak
+                # the parent-side pipe handles / reader thread.
+                try:
+                    self.tube.close()
+                except Exception:
+                    pass
+                self.tube = None
             err = ctypes.GetLastError()
             raise RuntimeError(f"CreateProcessW failed (err={err})")
 
@@ -283,6 +346,14 @@ class Debugger:
             invalidate_pdata_cache()
         except Exception:
             pass
+        # Tear down the interactive I/O tube (closes parent-side pipe handles
+        # and stops the reader thread) before we drop the process handles.
+        if self.tube is not None:
+            try:
+                self.tube.close()
+            except Exception:
+                pass
+            self.tube = None
         self.symbols.cleanup()
         for tid, th in self.threads.items():
             if th and th != self.main_thread_handle:
@@ -322,6 +393,71 @@ class Debugger:
         return None
 
     # -----------------------------------------------------------------
+    # Function auto-discovery (stripped-image analysis)
+    # -----------------------------------------------------------------
+
+    def analyze(self, force=False):
+        """Discover functions in the MAIN executable and register them.
+
+        Lazy + guarded: needs ``self.exe_path`` and a known image base. Skips
+        re-running for a base already analyzed unless ``force=True``. Imports
+        ``core.analysis`` lazily so nothing is pulled in until first use.
+
+        Returns the number of functions registered for the exe (0 on failure).
+        Never raises — analysis errors degrade to "no discovered functions".
+        """
+        try:
+            if not self.exe_path:
+                return 0
+
+            # Resolve the exe module's live base: prefer the tracked module
+            # whose path matches exe_path, else fall back to image_base.
+            base = None
+            try:
+                for mod in self.symbols.modules:
+                    if mod.path and os.path.normcase(mod.path) == \
+                            os.path.normcase(self.exe_path):
+                        base = mod.base_address
+                        break
+            except Exception:
+                base = None
+            if base is None:
+                base = self.image_base
+            if not base:
+                return 0
+
+            if not force and base in self.symbols.analyzed_bases:
+                return len(self.symbols.discovered)
+
+            from . import analysis
+            funcs = analysis.discover_functions(
+                self.exe_path, base, is_64=not self.is_wow64
+            )
+            self.symbols.set_discovered(funcs)
+            # Label the user's main() when we can find it (overrides sub_XXXX).
+            try:
+                main_va = analysis.detect_main(
+                    self.exe_path, base, is_64=not self.is_wow64
+                )
+                if main_va:
+                    self.symbols.set_discovered({main_va: "main"})
+            except Exception:
+                pass
+            # Name IAT jump-thunks after their import (ReadFile, printf, ...).
+            try:
+                thunks = analysis.name_thunks(
+                    self.exe_path, base, is_64=not self.is_wow64
+                )
+                if thunks:
+                    self.symbols.set_discovered(thunks)
+            except Exception:
+                pass
+            self.symbols.analyzed_bases.add(base)
+            return len(self.symbols.discovered)
+        except Exception:
+            return 0
+
+    # -----------------------------------------------------------------
     # Debug loop
     # -----------------------------------------------------------------
 
@@ -351,8 +487,18 @@ class Debugger:
 
     def run_until_stop(self):
         """Run the debug loop until we hit a breakpoint or other stop condition.
-        Uses short timeouts so Ctrl+C / interrupt() can take effect."""
+        Uses short timeouts so Ctrl+C / interrupt() can take effect.
+
+        If ``self.run_timeout`` is set (seconds), a run that produces no stop
+        within that window is force-interrupted so control returns as a
+        ``timeout`` stop instead of blocking forever — used by the AI agent so a
+        `continue` on a debuggee waiting for stdin doesn't hang the loop.
+        """
+        import time
         self._interrupt_requested = False
+        timeout_s = getattr(self, "run_timeout", None)
+        deadline = (time.monotonic() + timeout_s) if timeout_s else None
+        forced = False
         while True:
             # Poll with 100ms timeout so we remain responsive
             event = self.wait_for_event(timeout=100)
@@ -360,10 +506,22 @@ class Debugger:
                 # Timeout — check if we should keep waiting
                 if self.state == DebuggerState.TERMINATED:
                     return {"reason": "exit", "exit_code": -1}
+                if deadline is not None and not forced and \
+                        time.monotonic() >= deadline and \
+                        self.state == DebuggerState.RUNNING:
+                    # Bounded run (agent mode): force a break so control returns
+                    # instead of hanging (e.g. debuggee blocked reading stdin).
+                    forced = True
+                    self.interrupt()
                 continue
 
             result = self._handle_event(event)
             if result:
+                # Relabel the forced break so the caller/agent knows the process
+                # was still running (usually waiting for input), not a real BP.
+                if forced and result.get("reason") in ("interrupt", "single_step"):
+                    result["reason"] = "timeout"
+                    result["timed_out"] = True
                 self.last_stop_info = result
                 return result
 

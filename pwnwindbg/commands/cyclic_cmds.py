@@ -61,14 +61,15 @@ def cyclic_find(value, n=4):
         The offset (>= 0) if found, or -1 if not found.
     """
     if isinstance(value, int):
-        byte_len = n
         try:
-            b = value.to_bytes(byte_len, "little")
-            subseq = b.decode("ascii", errors="replace")
+            subseq = value.to_bytes(n, "little").decode("latin-1")
         except Exception:
             return -1
+    elif isinstance(value, (bytes, bytearray)):
+        # Raw bytes (e.g. read straight off the stack) — decode 1:1.
+        subseq = bytes(value).decode("latin-1")
     else:
-        subseq = value
+        subseq = str(value)
 
     # Generate a large enough pattern to search in
     pattern = cyclic(0x10000, n)
