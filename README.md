@@ -367,6 +367,7 @@ after `max_steps` iterations.
 | [capstone](https://www.capstone-engine.org/) | Disassembly engine |
 | [pefile](https://pypi.org/project/pefile/) | PE file parsing |
 | [rich](https://github.com/Textualize/rich) | Terminal colors and formatting |
+| [pillars](https://github.com/DFIRmadness/5pillars/blob/master/5-Pillars.md) | Skills for beginners |
 
 ## Project Structure
 
